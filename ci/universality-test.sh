@@ -80,6 +80,13 @@ for example in "$REPO"/examples/*/; do
   agent-secret check -q && ok "deployment reports itself configured" \
                         || no "agent-secret check failed"
 
+  # An example is a worked fork, so it must satisfy the same readiness gate a client deployment
+  # does — jobs present, context written, every job actually buildable. If an example cannot
+  # pass this, the gate is asking forks for something the framework's own examples do not do.
+  agent-status --ready >/dev/null 2>&1 && ok "the fork is complete (agent-status --ready)" \
+                                       || { no "agent-status --ready fails for this example"
+                                            agent-status --ready 2>&1 | sed 's/^/        /'; }
+
   # AGENTS.md instructs the agent to use kb. A documented command that does not exist is the
   # exact failure this repo was written to stop repeating, so it is asserted rather than assumed.
   if kb add "gate probe" </dev/null >/dev/null 2>&1 && kb index >/dev/null 2>&1 \
@@ -87,6 +94,21 @@ for example in "$REPO"/examples/*/; do
     ok "memory works: kb add / index / search"
   else
     no "kb round trip failed — AGENTS.md tells the agent to use it"
+  fi
+
+  # A fact that changed has to be retirable. Without it the knowledge base can only accumulate,
+  # and in a company where prices and contacts move, something retired eventually gets quoted
+  # back to a client as current.
+  probe="$(basename "$(ls "$data"/knowledge/notes/*gate-probe*.md 2>/dev/null | head -1)" .md)"
+  printf -- '---\nsupersedes: %s\n---\n# corrected probe\n\nthe replacement fact\n' "$probe" \
+    > "$data/knowledge/notes/zz-corrected-probe.md"
+  kb index >/dev/null 2>&1
+  if ! grep -q '\[gate probe\]' "$data/knowledge/INDEX.md" 2>/dev/null \
+     && grep -q '\[corrected probe\]' "$data/knowledge/INDEX.md" 2>/dev/null \
+     && kb search "gate probe" 2>/dev/null | grep -q 'superseded'; then
+    ok "a superseded note leaves INDEX.md but stays findable"
+  else
+    no "supersedes: did not retire the old note"
   fi
 
   if [ -n "$(find "$work/agent/mcp" -name '*.json' 2>/dev/null)" ]; then

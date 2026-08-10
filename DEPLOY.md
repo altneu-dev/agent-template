@@ -48,21 +48,47 @@ AGENT_ENV=HELPDESK_STORE=/data/work/tickets.json
 ```
 
 They live in one field because a platform only passes variables that `compose.yml` names, and
-`compose.yml` is frozen against verticals. If the client would rather their credentials never
-touch the platform's database, the alternative is `/data/.env` inside the volume — invisible
-to the UI, and rotating a value means opening a terminal in the container.
+`compose.yml` is frozen against verticals.
+
+### Where the credentials should live — decide this per client
+
+Anything set in the platform's UI arrives as an environment variable, which puts it in the
+container's config: readable by every process in the container, by every `docker exec`, and
+from `/proc/<pid>/environ` by anything the agent spawns. `agent-run` hands the credential only
+to the model process, but that care is undone upstream, and no harness can fix it while the
+platform is the one injecting the value.
+
+`agent-secret check` names the source of every required variable and says so out loud when one
+is exposed this way. That is the whole mitigation on this path, and for most deployments it is
+an acceptable trade for a one-click deploy.
+
+For a client who wants their credentials only on their own disk, put them in the volume
+instead — invisible to the platform's database, read on demand, never exported:
+
+```bash
+printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > /data/.env && chmod 600 /data/.env
+agent-secret check                       # should now say: from /data/.env
+```
+
+The cost is that rotating a value means opening a terminal in the container rather than editing
+a field. Everything else works identically.
 
 ## 3. Verify it landed — two minutes, once
 
 Coolify → Terminal, or `docker exec -it <container> bash`:
 
 ```bash
+agent-status --ready       # is this fork finished at all? names anything missing
 agent-status --memory      # record the volume id. It must never change.
-agent-secret check         # "all N required variable(s) are set"
+agent-secret check         # "all N required variable(s) are set", and where each came from
 agent-run --list           # the jobs this deployment defines
 agent-run <job> --probe-tools   # the tool surface, from pi itself. Costs nothing.
 agent-status --health      # ok
 ```
+
+`--ready` first: a half-filled fork deploys, reports healthy and idles forever doing nothing,
+which is the failure that looks most like success. It is also printed by the container on
+start, so the platform's log tab already shows it.
 
 `--probe-tools` is worth running even when you are confident: it asks pi what the job can
 actually do, rather than what the job file says it should.
@@ -158,13 +184,20 @@ Coolify → Scheduled Tasks, container command `agent-run <job>`. Exit codes are
 
 | code | meaning | what a scheduler should do |
 |---|---|---|
-| 0 | ran, produced a result | nothing |
+| 0 | ran, produced a result, met its contract | nothing |
 | 10 | misconfigured — **nothing was run, nothing spent** | alert; never retry, the config is wrong |
 | 11 | another run of this job is in progress | ignore |
 | 20 | provider or auth error | alert; do not retry |
 | 21 | provider busy or rate limited | retry later |
 | 22 | timed out | alert |
 | 30 | ran but produced no result | alert |
+| 31 | claimed to be done, but did not produce what the job declared | alert — do not retry blindly |
+| 32 | stopped deliberately and asked for a human | route to a person; this is correct behaviour |
+
+`31` and `32` are the two worth wiring up properly. `31` means the model reported success and
+the harness disagreed — retrying may simply repeat it, so a person should look. `32` is not a
+failure at all: the agent hit something outside its remit and stopped instead of guessing, and
+the request is waiting in `/data/work/escalations/`.
 
 Host cron with `docker exec` works identically if you would rather not depend on the
 platform's scheduler.
@@ -172,7 +205,13 @@ platform's scheduler.
 ## 8. Day two
 
 - **Rotate a secret:** change it in the UI → Redeploy → `agent-secret check`.
+- **What did it change in our systems?** `agent-status --effects`. Every external effect is an
+  MCP call, so the ledger is complete by construction. `UNFINISHED` means a call was sent and
+  no completion was recorded — check the target system before re-running the job.
 - **Upgrade:** `git push`. `/app` is replaced, `/data` is not.
+- **Which commit is running?** `agent-status --memory` prints it when the platform sets
+  `SOURCE_COMMIT`, which Coolify does. The build id says *whether* something changed; only the
+  commit says *what*.
 - **Read-only rootfs:** only `/data` and `/tmp` are writable. `apt install` in a terminal will
   fail; that is the design, not a fault.
 - **Watch cost:** `agent-status` shows per-run cost and a total. A real number in week one is

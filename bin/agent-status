@@ -3,6 +3,8 @@
 #
 #   agent-status              the last runs: when, how long, outcome, cost of failure
 #   agent-status <job>        the same, for one job, plus the last failure's reason
+#   agent-status --effects    what this deployment changed OUTSIDE the container
+#   agent-status --ready      exit 1 if this fork is not finished (no jobs, no context, ...)
 #   agent-status --health     exit 1 if the most recent run of any job failed (HEALTHCHECK)
 #   agent-status --json       machine-readable, for a host-side check
 #
@@ -24,11 +26,13 @@ JOB=""
 # its old meaning: the run table, as JSON.
 while [ $# -gt 0 ]; do
   case "$1" in
-    --health) MODE=health; shift ;;
-    --memory) MODE=memory; shift ;;
+    --health)  MODE=health; shift ;;
+    --memory)  MODE=memory; shift ;;
+    --effects) MODE=effects; shift ;;
+    --ready)   MODE=ready; shift ;;
     --json)   JSON=1; shift ;;
     -n)       LIMIT="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)        JOB="$1"; shift ;;
   esac
 done
@@ -108,6 +112,12 @@ boots, builds = lines("boots.jsonl"), lines("builds.jsonl")
 known = [b.get("build") for b in builds if b.get("build") and b.get("build") != "unknown"]
 distinct = sorted(set(known), key=known.index)
 
+# The commit that produced the running image, recorded by agent-init from SOURCE_COMMIT when
+# the platform sets it. The build id is a content digest and answers "did this change"; only
+# the commit answers "which change", which is what makes a fleet across many client servers
+# debuggable. A label, never load-bearing: platforms set it inconsistently and it may be empty.
+commit = next((b.get("commit") for b in reversed(builds) if b.get("commit")), "")
+
 survived_restart  = len(boots) >= 2
 survived_redeploy = len(distinct) >= 2
 
@@ -134,6 +144,7 @@ if want_json:
         "boots": len(boots),
         "builds": len(distinct),
         "current_build": (boots[-1].get("build") if boots else None),
+        "source_commit": commit or None,
         "survived_restart": survived_restart,
         "survived_redeploy": survived_redeploy,
         "runs": runs, "notes": notes,
@@ -147,6 +158,8 @@ print(f"  volume id      {origin.get('volume_id', '-')}     <- record this; it m
 print(f"  first seen     {origin.get('first_seen_utc', '-')}")
 print(f"  boots          {len(boots)}" + (f"   (this one {boots[-1].get('boot_utc')})" if boots else ""))
 print(f"  image builds   {len(distinct)}" + (f"   (now {distinct[-1]})" if distinct else ""))
+if commit:
+    print(f"  from commit    {commit[:12]}")
 print(f"  corroboration  {runs} run(s) recorded, {notes} knowledge note(s)")
 print()
 
@@ -174,6 +187,145 @@ PY
   exit $?
 fi
 
+# --- ready: is this fork actually finished? ------------------------------------------
+# A half-filled fork deploys, reports healthy, and idles politely forever doing nothing. That
+# is the worst way for it to fail, because everything looks fine — so this says out loud what
+# is missing, and the idle banner prints it where a platform's log tab shows it.
+#
+# Deliberately NOT part of --health. Health is the HEALTHCHECK, and a deployment nobody has
+# configured yet is not sick; making it unhealthy would block the very deploy that carries the
+# configuration.
+if [ "$MODE" = ready ]; then
+  problems=0
+  note() { echo "$@"; problems=$((problems + 1)); }
+
+  jobs=0
+  for f in "$DATA/jobs"/*.md; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = README.md ] && continue
+    jobs=$((jobs + 1))
+  done
+  [ "$jobs" = 0 ] && note "no jobs: this agent has nothing it can be asked to do.
+  Add one to agent/jobs/ — see its README."
+
+  # A fork that never replaced context/ has not been told who it works for. The marker is in
+  # the template's own README, so any real file — added or written over it — counts.
+  ctx=0
+  for f in "$DATA/context"/*; do
+    [ -f "$f" ] || continue
+    grep -q 'agent-template:placeholder' "$f" 2>/dev/null && continue
+    ctx=$((ctx + 1))
+  done
+  [ "$ctx" = 0 ] && note "no context: agent/context/ is still the template's placeholder.
+  The agent does not know who it works for, what is in scope, or what it must never touch."
+
+  agent-secret check -q 2>/dev/null || note "not configured: $(agent-secret check 2>&1 | head -3 | tr '\n' ' ')"
+
+  if [ -n "$(find "${AGENT_APP:-/app}/agent/mcp" -name '*.json' 2>/dev/null)" ]; then
+    agent-mcp check >/dev/null 2>&1 || note "MCP definitions do not resolve: run agent-mcp check"
+  fi
+
+  # Building each job's command catches what static checks cannot: a job naming a skill that
+  # was never shipped, a prompt that is missing, front matter that does not parse. It costs
+  # nothing — --dry-run touches nothing and calls no model.
+  for f in "$DATA/jobs"/*.md; do
+    [ -e "$f" ] || continue
+    j="$(basename "$f" .md)"; [ "$j" = README ] && continue
+    agent-run "$j" --dry-run >/dev/null 2>&1 || note "job '$j' does not build: run agent-run $j --dry-run"
+  done
+
+  if [ "$problems" = 0 ]; then
+    echo "ready: $jobs job(s), context configured, credentials present"
+    exit 0
+  fi
+  echo
+  echo "$problems thing(s) to finish before this deployment can do anything."
+  exit 1
+fi
+
+# --- effects: what did this deployment change outside itself? -----------------------
+# runs.jsonl answers "what ran". After an incident nobody asks that; they ask what was
+# touched. Built-in tools cannot leave the container, so every external effect is an MCP call
+# and the ledger is complete by construction — see agent/extensions/mcp-tools.ts.
+if [ "$MODE" = effects ]; then
+  python3 - "$DATA/logs/effects.jsonl" "$LIMIT" "$JOB" "$JSON" <<'PY'
+import json, os, sys
+path, limit, job, want_json = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
+
+events = []
+try:
+    for ln in open(path, encoding='utf-8', errors='replace'):
+        ln = ln.strip()
+        if ln:
+            try: events.append(json.loads(ln))
+            except json.JSONDecodeError: pass
+except OSError:
+    if want_json:
+        print("[]"); raise SystemExit(0)
+    print("no external effects recorded.")
+    print("  Either nothing has reached outside the container, or no job here declares mcp.")
+    raise SystemExit(0)
+
+# Pair the two phases by call id. An unpaired `start` is the one that matters: something was
+# sent to a client's system and no completion was ever recorded, so whether it landed is
+# unknown. That is a different fact from "it failed", and it must not be rendered as one.
+calls, order = {}, []
+for e in events:
+    cid = e.get("call")
+    if not cid:
+        continue
+    if cid not in calls:
+        calls[cid] = {}
+        order.append(cid)
+    calls[cid].update(e if e.get("phase") == "start" else
+                      {k: v for k, v in e.items() if k not in ("utc", "phase")})
+    if e.get("phase") == "end":
+        calls[cid]["outcome"] = e.get("outcome", "ok")
+
+rows = [calls[c] for c in order]
+if job:
+    rows = [r for r in rows if r.get("job") == job]
+rows = rows[-limit:]
+
+if want_json:
+    json.dump(rows, sys.stdout, indent=2); print(); raise SystemExit(0)
+
+if not rows:
+    print(f"no external effects recorded{' for ' + job if job else ''}.")
+    raise SystemExit(0)
+
+print(f"{'when (UTC)':<18} {'job':<14} {'tool':<30} {'outcome':<10} {'ms':>6}")
+print("-" * 84)
+unknown = failed = 0
+for r in rows:
+    outcome = r.get("outcome")
+    if outcome is None:
+        shown, unknown = "UNFINISHED", unknown + 1
+    elif outcome != "ok":
+        shown, failed = "ERROR", failed + 1
+    else:
+        shown = "ok"
+    tool = f"{r.get('server','?')}__{r.get('tool','?')}"
+    print(f"{r.get('utc',''):<18} {r.get('job',''):<14} {tool:<30} {shown:<10} "
+          f"{str(r.get('ms','-')):>6}")
+    if r.get("error"):
+        print(f"{'':18} {'':14} -> {str(r['error'])[:56]}")
+
+print()
+print(f"{len(rows)} call(s), {failed} failed, {unknown} with no recorded outcome")
+if unknown:
+    print()
+    print("UNFINISHED means the call was sent and no completion was ever recorded — the run")
+    print("was killed mid-call, or the process died. Whether the far side applied it is not")
+    print("knowable from here. Check the target system before re-running the job.")
+
+# Argument values are deliberately absent: they are the payload that reached the client's
+# systems. Keys and a digest are recorded instead. AGENT_EFFECTS_VERBOSE=1 changes that while
+# building a vertical, and should not be left on.
+PY
+  exit $?
+fi
+
 # One line, only when the evidence is thin. Someone reading this daily should see nothing;
 # someone whose deployment is quietly losing its memory should not be able to miss it.
 # A wc -l rather than a second python start, since this runs on every invocation.
@@ -196,6 +348,8 @@ MEANING = {
     21: "provider busy",
     22: "timed out",
     30: "no result",
+    31: "contract not met",
+    32: "escalated",
     40: "internal error",
 }
 

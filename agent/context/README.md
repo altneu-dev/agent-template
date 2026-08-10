@@ -1,3 +1,4 @@
+<!-- agent-template:placeholder — `agent-status --ready` reads this marker to tell a filled-in fork from an empty one. Delete this file or write over it. -->
 # context/
 
 What **this** agent is for. Replaced per deployment; the framework never reads these files,
