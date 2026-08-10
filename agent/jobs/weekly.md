@@ -1,6 +1,7 @@
 ---
 description: Summarise this week's notes into a report for the team.
 tools: read, ls, grep, write
+produces: work/reports/weekly.md
 timeout_s: 600
 ---
 Read the notes under `knowledge/notes/` and write a summary of the week to
