@@ -60,6 +60,14 @@ COPY knowledge/ /app/knowledge/
 COPY .env.example /app/.env.example
 RUN chmod +x /app/bin/*
 
+# PATH twice over, because the two ways in resolve it differently. `ENV PATH` covers direct
+# exec (`docker compose exec agent agent-status`). A LOGIN shell — which is what you get from
+# `docker compose exec agent bash -l`, the natural way to look around inside a deployment —
+# rebuilds PATH from /etc/profile and drops it again. Without this line the commands are
+# missing in exactly the situation where a human is looking for them, on an image that is
+# otherwise healthy.
+RUN printf 'PATH=/app/bin:$PATH\n' > /etc/profile.d/10-agent-path.sh
+
 # /data is a mountpoint. Creating it here with the right owner means the container also
 # works with no volume attached at all — useful for CI and for `docker run` smoke tests.
 RUN mkdir -p /data && chown "${AGENT_UID}:${AGENT_GID}" /data

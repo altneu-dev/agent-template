@@ -68,6 +68,11 @@ jobs:
           # bug this job caught on its first run.
           run test -f /app/.env.example
 
+          # A login shell is what `docker compose exec agent bash -l` gives you, and it
+          # rebuilds PATH from /etc/profile. Asserted separately from direct exec because the
+          # two resolve PATH by different mechanisms and only one of them was ever right.
+          run sh -lc 'command -v agent-run >/dev/null && command -v kb >/dev/null'
+
           run agent-init --check
           run agent-run --list
           echo "$(run agent-mcp check)"  | grep -q "no MCP servers configured"
