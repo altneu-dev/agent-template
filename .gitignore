@@ -1,0 +1,9 @@
+# Dependencies are restored by `npm install` from the committed lockfile.
+node_modules/
+
+# Real configuration. .env.example is the committed contract; .env is the values.
+.env
+
+# Python bytecode from the stdlib MCP servers
+__pycache__/
+*.pyc

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+# probe-mcp-server — a minimal stdio MCP server that exists only to be checked.
+#
+# It answers `initialize` and `tools/list` over line-delimited JSON-RPC on stdin/stdout,
+# and nothing else. Standard library only, so it runs on any architecture with no install
+# step and no network — which is what lets CI prove the MCP path end to end offline.
+#
+# The whole trick is the tool name:
+#
+#     PROBE_TOKEN == "probe-value-ok"  ->  probe_token_seen
+#     anything else                    ->  probe_token_missing
+#
+# One assertion on that name proves the entire chain in a single step: the definition was
+# found in the volume, the JSON was merged, ${PROBE_TOKEN} was expanded from the mounted
+# secrets file, the server was spawned with that environment, and the MCP handshake
+# completed. A `test -f` on a config file — which is what CI checked before — proves none
+# of it.
+import json
+import os
+import sys
+
+EXPECTED = "probe-value-ok"
+
+TOOL = ("probe_token_seen" if os.environ.get("PROBE_TOKEN") == EXPECTED
+        else "probe_token_missing")
+
+
+def reply(msg_id, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+
+    method, msg_id = msg.get("method"), msg.get("id")
+
+    # Notifications carry no id and take no answer. Replying to one is a protocol error
+    # that some clients treat as fatal.
+    if msg_id is None:
+        continue
+
+    if method == "initialize":
+        reply(msg_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "probe-mcp-server", "version": "1"},
+        })
+    elif method == "tools/list":
+        reply(msg_id, {"tools": [{
+            "name": TOOL,
+            "description": "Reports whether the probe token arrived in this server's environment.",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]})
+    else:
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0", "id": msg_id,
+            "error": {"code": -32601, "message": f"method not found: {method}"},
+        }) + "\n")
+        sys.stdout.flush()

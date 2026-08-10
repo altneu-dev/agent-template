@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "helpdesk": {
+      "command": "helpdesk-mcp",
+      "env": { "HELPDESK_STORE": "${HELPDESK_STORE}" }
+    }
+  }
+}

@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# agent-status — what has this agent been doing?
+#
+#   agent-status              the last runs: when, how long, outcome, cost of failure
+#   agent-status <job>        the same, for one job, plus the last failure's reason
+#   agent-status --health     exit 1 if the most recent run of any job failed (HEALTHCHECK)
+#   agent-status --json       machine-readable, for a host-side check
+#
+# Observability here is files in the volume, read on demand — not a daemon and not a port.
+# It survives restarts, exposes no new surface inside the client's network, works the same on
+# a rented box and on a machine in their office, and the client can read it themselves. That
+# last property is worth more for trust than any dashboard.
+set -uo pipefail
+
+DATA="${AGENT_DATA:-/data}"
+RUNS="$DATA/logs/runs"
+LOG="$DATA/logs/runs.jsonl"
+LIMIT="${AGENT_STATUS_LIMIT:-15}"
+
+MODE=table
+JOB=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --health) MODE=health; shift ;;
+    --json)   MODE=json; shift ;;
+    -n)       LIMIT="${2:?}"; shift 2 ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)        JOB="$1"; shift ;;
+  esac
+done
+
+# Health is judged from the last run of each job. A fresh deployment that has never run is
+# healthy — "not started yet" is not a fault, and reporting it as one would make every new
+# client deployment look broken on arrival.
+if [ "$MODE" = health ]; then
+  [ -d "$RUNS" ] || exit 0
+  rc=0
+  for f in "$RUNS"/*/last.json; do
+    [ -e "$f" ] || continue
+    e=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('exit',0))" "$f" 2>/dev/null || echo 0)
+    if [ "$e" != 0 ]; then
+      echo "unhealthy: $(basename "$(dirname "$f")") last exited $e"
+      rc=1
+    fi
+  done
+  [ "$rc" = 0 ] && echo "ok"
+  exit $rc
+fi
+
+[ -f "$LOG" ] || { echo "no runs recorded yet."; echo "  Run one with: agent-run <job>   ('agent-run --list' shows them)"; exit 0; }
+
+python3 - "$LOG" "$LIMIT" "$JOB" "$MODE" "$RUNS" <<'PY'
+import json, sys, os
+log, limit, job, mode, runs = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+
+MEANING = {
+    0:  "ok",
+    10: "not configured",
+    11: "already running",
+    20: "provider/auth",
+    21: "provider busy",
+    22: "timed out",
+    30: "no result",
+    40: "internal error",
+}
+
+rows = []
+for line in open(log, encoding='utf-8', errors='replace'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rows.append(json.loads(line))
+    except json.JSONDecodeError:
+        continue
+if job:
+    rows = [r for r in rows if r.get('job') == job]
+rows = rows[-limit:]
+
+if mode == 'json':
+    json.dump(rows, sys.stdout, indent=2)
+    print()
+    sys.exit(0)
+
+if not rows:
+    print(f"no runs recorded{' for ' + job if job else ''}.")
+    sys.exit(0)
+
+print(f"{'started (UTC)':<18} {'job':<16} {'took':>6} {'cost':>8}  outcome")
+print("-" * 70)
+failures = []
+total = 0.0
+for r in rows:
+    code = int(r.get('exit', 40))
+    label = MEANING.get(code, f"exit {code}")
+    mark = " " if code == 0 else "!"
+    cost = float(r.get('cost_usd', 0) or 0)
+    total += cost
+    shown = f"${cost:.4f}" if cost else "-"
+    print(f"{r.get('started_utc',''):<18} {r.get('job',''):<16} "
+          f"{str(r.get('duration_s',0))+'s':>6} {shown:>8}  {mark}{label}")
+    if code != 0:
+        failures.append(r)
+
+ok = sum(1 for r in rows if int(r.get('exit', 40)) == 0)
+print()
+# Cost is on the table from day one because it is the first thing a client asks and the last
+# thing anyone instruments. A real number in week one is worth more than an estimate.
+print(f"{ok}/{len(rows)} succeeded    total ${total:.4f}")
+
+# The reason belongs next to the failure. Making someone find the run directory and open a
+# log is how a failure stays unexplained until it repeats.
+if failures:
+    last = failures[-1]
+    d = last.get('dir', '')
+    print()
+    print(f"last failure — {last.get('job')} at {last.get('started_utc')} "
+          f"({MEANING.get(int(last.get('exit',40)), '')})")
+    # The provider's own message, captured from the run stream, is the useful one. pi often
+    # writes nothing to stderr for an API-level failure, so stderr alone leaves it blank.
+    reason = (last.get('error') or '').strip()
+    if reason:
+        print(f"  {reason[:200]}")
+    else:
+        err = os.path.join(d, 'stderr.log')
+        if os.path.isfile(err):
+            for line in [l.rstrip() for l in open(err, encoding='utf-8', errors='replace') if l.strip()][:3]:
+                print(f"  {line[:110]}")
+    print(f"  full record: {d}")
+PY

@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# agent-run — run one job, once, with nobody watching.
+#
+#   agent-run <job>              run jobs/<job>.md
+#   agent-run <job> --dry-run    print the exact command that would run; touch nothing
+#   agent-run <job> --probe-tools  ask pi what tools this job really gets; costs nothing
+#   agent-run --list             the jobs this deployment defines
+#
+# This is the unit of automation. A job file declares what the agent may use; this builds the
+# run from that declaration, refuses to start when the deployment is misconfigured, and
+# records what happened where something other than a human can read it.
+#
+# Exit codes are the interface a scheduler consumes:
+#
+#    0  ran, produced a result
+#   10  preflight failed — configuration is wrong. NO model call was made, nothing was spent
+#   11  another run of this job is in progress
+#   20  provider or authentication error — configuration is wrong, do NOT retry
+#   21  provider temporarily unavailable (rate limit, overload) — safe to retry
+#   22  timed out
+#   30  ran, but produced no result
+#   40  internal error
+#
+# 10 is the important one: a misconfigured deployment must cost nothing and must say which
+# variable is missing, rather than failing somewhere inside a run with an opaque auth error.
+set -uo pipefail
+
+APP="${AGENT_APP:-/app}"
+DATA="${AGENT_DATA:-/data}"
+JOBS="$DATA/jobs"
+RUNS="$DATA/logs/runs"
+
+die() { echo "agent-run: $*" >&2; exit 40; }
+
+# ---------------------------------------------------------------- arguments
+DRY=0
+PROBE=0
+JOB=""
+EXTRA=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1; shift ;;
+    --probe-tools) PROBE=1; shift ;;
+    --list)
+      [ -d "$JOBS" ] || { echo "no jobs directory at $JOBS"; exit 0; }
+      found=0
+      for f in "$JOBS"/*.md; do
+        [ -e "$f" ] || continue
+        b=$(basename "$f" .md); [ "$b" = "README" ] && continue
+        d=$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -1)
+        printf '  %-24s %s\n' "$b" "$d"; found=1
+      done
+      [ "$found" = 0 ] && echo "no jobs defined — add one to agent/jobs/ (see its README)"
+      exit 0 ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; EXTRA+=("$@"); break ;;
+    -*) die "unknown option $1" ;;
+    *)  if [ -z "$JOB" ]; then JOB="$1"; else EXTRA+=("$1"); fi; shift ;;
+  esac
+done
+[ -n "$JOB" ] || { echo "usage: agent-run <job> [--dry-run]   ('agent-run --list' shows them)" >&2; exit 40; }
+
+JOB_FILE="$JOBS/$JOB.md"
+[ -f "$JOB_FILE" ] || {
+  echo "agent-run: no such job: $JOB" >&2
+  echo "  jobs live in agent/jobs/ and arrive with the deployment; 'agent-run --list' shows them." >&2
+  exit 10
+}
+
+# ---------------------------------------------------------------- job file
+# Front matter drives the run. Parsed with python because YAML-ish parsing in bash is how
+# quoting accidents become security decisions.
+eval "$(python3 - "$JOB_FILE" <<'PY'
+import re, shlex, sys
+raw = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+meta, body = {}, raw
+m = re.match(r'^---\s*\n(.*?)\n---\s*\n?(.*)$', raw, re.S)
+if m:
+    body = m.group(2)
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or ':' not in line:
+            continue
+        k, v = line.split(':', 1)
+        v = v.strip().strip('"').strip("'")
+        meta[k.strip()] = v
+
+def listv(key):
+    return [x.strip() for x in meta.get(key, '').split(',') if x.strip()]
+
+out = {
+    'JOB_DESC':    meta.get('description', ''),
+    'JOB_TOOLS':   ','.join(listv('tools')),
+    'JOB_MCP':     ' '.join(listv('mcp')),
+    'JOB_ALLOW':   ','.join(listv('allow')),
+    'JOB_SKILLS':  ' '.join(listv('skills')),
+    'JOB_TIMEOUT': meta.get('timeout_s', ''),
+    'JOB_MODEL':   meta.get('model', ''),
+    'JOB_PROVIDER':meta.get('provider', ''),
+    'JOB_THINKING':meta.get('thinking', ''),
+    'JOB_PROMPT':  body.strip(),
+}
+for k, v in out.items():
+    print(f"{k}={shlex.quote(v)}")
+PY
+)" || die "cannot parse $JOB_FILE"
+
+[ -n "${JOB_PROMPT:-}" ] || { echo "agent-run: $JOB.md has no prompt below its front matter" >&2; exit 10; }
+
+# Settings resolve job front matter first, then agent-secret — which itself reads the
+# environment, then the secrets file, then .env.example's default. Reading $AGENT_PROVIDER
+# directly here would skip the last of those, so the committed default would silently never
+# apply and pi would fall back to its own provider instead.
+cfg() { agent-secret get "$1" 2>/dev/null || printf '%s' "${2:-}"; }
+
+TIMEOUT="${JOB_TIMEOUT:-$(cfg AGENT_RUN_TIMEOUT 900)}"
+PROVIDER="${JOB_PROVIDER:-$(cfg AGENT_PROVIDER)}"
+MODEL="${JOB_MODEL:-$(cfg AGENT_MODEL)}"
+
+# ---------------------------------------------------------------- preflight (costs nothing)
+if [ "$DRY" = 0 ]; then
+  agent-init || exit 10
+
+  if ! agent-secret check -q; then
+    echo "agent-run: this deployment is not configured — nothing was run and nothing was spent." >&2
+    agent-secret check >&2
+    exit 10
+  fi
+
+  if [ -n "${JOB_MCP:-}" ] && ! agent-mcp check >/dev/null 2>&1; then
+    echo "agent-run: MCP is not usable for job '$JOB' — nothing was run." >&2
+    agent-mcp check >&2
+    exit 10
+  fi
+fi
+
+# ---------------------------------------------------------------- build the command
+# The safety spine, applied to every run regardless of what the job says:
+#
+#   --print          non-interactive; nobody is here to answer a prompt
+#   --mode json      a machine-readable record instead of a terminal transcript
+#   -na              ignore project-local dynamic config. /data is writable by the agent, so
+#                    without this a file the agent itself wrote could load an extension on
+#                    the next run. Verified not to affect AGENTS.md discovery.
+#   -ne              no extension discovery; only extensions named here load
+#   --tools          the allowlist from the job. Verified: pi honours this over built-in,
+#                    extension and custom tools alike, so a tool absent here does not exist
+#                    during the run
+ARGS=(--print --mode json -na -ne)
+
+# --- MCP: resolve the tool names BEFORE --tools is built --------------------------------
+# `--tools` is a hard ceiling: verified against pi 0.84, a tool absent from it is missing
+# from getAllTools() entirely and an extension cannot add it back. So every MCP tool the job
+# should have must be named here, or the extension will register it into a void.
+MCP_TOOL_LIST=""
+if [ -n "${JOB_MCP:-}" ]; then
+  [ -f "$APP/agent/extensions/mcp-tools.ts" ] || die "job declares mcp but the extension is missing"
+
+  if [ -n "${JOB_ALLOW:-}" ]; then
+    MCP_TOOL_LIST="$JOB_ALLOW"
+  elif [ "$DRY" = 0 ] || [ "$PROBE" = 1 ]; then
+    # No `allow:` line — ask the servers what they offer and grant all of it. Convenient
+    # while building a job, and recorded in meta.json so a widened surface is never silent.
+    # An explicit `allow:` is better: it does not change when a server is upgraded.
+    MCP_TOOL_LIST=$(agent-mcp tools $JOB_MCP 2>/dev/null | paste -sd, -)
+    [ -n "$MCP_TOOL_LIST" ] || {
+      echo "agent-run: job '$JOB' declares mcp: $JOB_MCP but no tools could be listed." >&2
+      echo "  Check with: agent-mcp probe" >&2
+      exit 10
+    }
+    echo "agent-run: job '$JOB' has no 'allow:' line — granting every tool the servers offer:" >&2
+    echo "  $MCP_TOOL_LIST" >&2
+  fi
+fi
+
+# Built-ins from the job, plus the MCP tools resolved above. One flag, one ceiling.
+TOOL_LIST="${JOB_TOOLS:-}"
+if [ -n "$MCP_TOOL_LIST" ]; then
+  TOOL_LIST="${TOOL_LIST:+$TOOL_LIST,}$MCP_TOOL_LIST"
+fi
+
+if [ -n "$TOOL_LIST" ]; then
+  ARGS+=(--tools "$TOOL_LIST")
+else
+  # A job that declares no tools gets none. Silence here would mean "all of them", which is
+  # the wrong default for something that runs unattended against a client's systems.
+  ARGS+=(--no-tools)
+fi
+
+[ -n "${JOB_MCP:-}" ] && ARGS+=(-e "$APP/agent/extensions/mcp-tools.ts")
+
+if [ -n "${JOB_SKILLS:-}" ]; then
+  for s in $JOB_SKILLS; do
+    if   [ -e "$DATA/skills/$s" ];          then ARGS+=(--skill "$DATA/skills/$s")
+    elif [ -e "$DATA/skills/$s/SKILL.md" ]; then ARGS+=(--skill "$DATA/skills/$s/SKILL.md")
+    else echo "agent-run: job '$JOB' names skill '$s', which this deployment does not have" >&2; exit 10
+    fi
+  done
+else
+  ARGS+=(--no-skills)
+fi
+
+[ -n "$PROVIDER" ]           && ARGS+=(--provider "$PROVIDER")
+[ -n "$MODEL" ]              && ARGS+=(--model "$MODEL")
+[ -n "${JOB_THINKING:-}" ]   && ARGS+=(--thinking "$JOB_THINKING")
+
+# Sessions are off by default: runs do not share memory, so there is nothing to resume, and a
+# session file would hold whatever the agent read from the client's systems. Continuity comes
+# from what the job writes down, not from conversation history.
+if [ "${AGENT_RUN_SESSION:-}" = "keep" ]; then
+  ARGS+=(--session-dir "$DATA/.pi/sessions")
+else
+  ARGS+=(--no-session)
+fi
+
+PROMPT="$JOB_PROMPT"
+[ ${#EXTRA[@]} -gt 0 ] && PROMPT="$PROMPT"$'\n\n'"${EXTRA[*]}"
+
+# --probe-tools answers "what will this job actually be able to do?" from pi itself rather
+# than from reading config. It starts a real session with the real arguments, prints the tool
+# surface, and stops before any model request — so it costs nothing and needs no credentials
+# beyond passing preflight. This is also the assertion CI runs.
+if [ "$PROBE" = 1 ]; then
+  [ -f "$APP/ci/tools-probe.ts" ] || die "ci/tools-probe.ts is missing"
+  # The extension needs its config here too, or it registers nothing and the probe would
+  # report a smaller surface than a real run — the wrong direction for a safety check to err.
+  if [ -n "${JOB_MCP:-}" ]; then
+    agent-init >/dev/null 2>&1
+    AGENT_MCP_CONFIG=$(AGENT_MCP_PID=$$ agent-mcp render 2>/dev/null) || \
+      die "cannot render the MCP config for --probe-tools"
+    export AGENT_MCP_CONFIG
+    export AGENT_MCP_SERVERS="$JOB_MCP"
+    export AGENT_MCP_ALLOW="$MCP_TOOL_LIST"
+  fi
+  out=$(cd "$DATA" && timeout 60 pi "${ARGS[@]}" --offline -e "$APP/ci/tools-probe.ts" \
+          "probe" </dev/null 2>&1 | grep -o 'TOOLPROBE:.*' | head -1)
+  [ -n "$out" ] || { echo "agent-run: could not determine the tool surface for '$JOB'" >&2; exit 40; }
+  echo "${out#TOOLPROBE:}"
+  exit 0
+fi
+
+if [ "$DRY" = 1 ]; then
+  echo "job:      $JOB${JOB_DESC:+  — $JOB_DESC}"
+  echo "timeout:  ${TIMEOUT}s"
+  echo "tools:    ${JOB_TOOLS:-<none>}"
+  echo "mcp:      ${JOB_MCP:-<none>}${JOB_ALLOW:+   allow: $JOB_ALLOW}"
+  echo "skills:   ${JOB_SKILLS:-<none>}"
+  echo "command:"
+  printf '  pi'; for a in "${ARGS[@]}"; do printf ' %q' "$a"; done; printf ' <prompt>\n'
+  exit 0
+fi
+
+# ---------------------------------------------------------------- one at a time
+mkdir -p "$RUNS/$JOB" 2>/dev/null
+exec 9>"$RUNS/$JOB/.lock" || die "cannot create the run lock"
+if ! flock -n 9; then
+  echo "agent-run: '$JOB' is already running — leaving it alone." >&2
+  exit 11
+fi
+
+RUN_ID=$(tr -dc 'a-f0-9' </proc/sys/kernel/random/uuid | cut -c1-12)
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+RUN_DIR="$RUNS/$JOB/$STAMP-$RUN_ID"
+mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR" || die "cannot create $RUN_DIR"
+
+# Retention is a privacy control as much as a disk one: run records hold whatever the agent
+# read from the client's systems.
+KEEP="$(cfg AGENT_RUN_KEEP 30)"
+ls -1dt "$RUNS/$JOB"/*-* 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r old; do
+  [ -d "$old" ] && rm -rf "$old"
+done
+
+MCP_SERVERS=""
+if [ -n "${JOB_MCP:-}" ]; then
+  # The rendered config holds real credentials, so it goes to container-local tmpfs at 0600
+  # and only its path is passed on. Named after this process, and reaped by the next run when
+  # /proc says the owner is gone — a run killed by its own timeout never gets to clean up.
+  MCP_CFG=$(AGENT_MCP_PID=$$ agent-mcp render 2>>"$RUN_DIR/stderr.log")
+  case $? in
+    0) ;;
+    2) echo "agent-run: job '$JOB' declares mcp but no definitions were found" >&2; exit 10 ;;
+    *) echo "agent-run: MCP config could not be rendered" >&2; exit 10 ;;
+  esac
+  export AGENT_MCP_CONFIG="$MCP_CFG"
+  export AGENT_MCP_SERVERS="$JOB_MCP"
+  export AGENT_MCP_ALLOW="$MCP_TOOL_LIST"
+  MCP_SERVERS="$JOB_MCP"
+fi
+
+START=$(date -u +%s)
+printf '%s' "$PROMPT" > "$RUN_DIR/prompt.txt"
+cd "$DATA" || die "cannot enter $DATA"
+
+# The credential reaches pi through the environment of this one child process, and nowhere
+# else. Not `--api-key`, which would put the secret in `ps` and in /proc/<pid>/cmdline for
+# every process on the host to read. Not `set -a; . .env`, which would export every value to
+# every descendant including whatever an MCP server spawns.
+case "${AGENT_API_KEY_VAR:-}" in
+  "") case "$PROVIDER" in
+        anthropic*) KEY_VAR=ANTHROPIC_API_KEY ;;
+        openai*)    KEY_VAR=OPENAI_API_KEY ;;
+        google*|gemini*) KEY_VAR=GEMINI_API_KEY ;;
+        *)          KEY_VAR="" ;;
+      esac ;;
+  *)  KEY_VAR="$AGENT_API_KEY_VAR" ;;
+esac
+
+KEY_VALUE=""
+if [ -n "$KEY_VAR" ]; then
+  KEY_VALUE=$(agent-secret get "$KEY_VAR" 2>/dev/null) || KEY_VALUE=""
+  # Google also accepts GOOGLE_API_KEY; try the alternative before giving up, so a working
+  # deployment is not rejected over a naming preference.
+  if [ -z "$KEY_VALUE" ] && [ "$KEY_VAR" = GEMINI_API_KEY ]; then
+    KEY_VALUE=$(agent-secret get GOOGLE_API_KEY 2>/dev/null) || KEY_VALUE=""
+    [ -n "$KEY_VALUE" ] && KEY_VAR=GOOGLE_API_KEY
+  fi
+fi
+
+if [ -n "$KEY_VAR" ] && [ -n "$KEY_VALUE" ]; then
+  env "$KEY_VAR=$KEY_VALUE" \
+    timeout --signal=TERM --kill-after=20 "$TIMEOUT" \
+    pi "${ARGS[@]}" "$PROMPT" </dev/null >"$RUN_DIR/result.jsonl" 2>"$RUN_DIR/stderr.log"
+else
+  # No mapped variable: pi falls back to whatever is already in the environment, which is how
+  # a platform-injected credential for an unmapped provider still works.
+  timeout --signal=TERM --kill-after=20 "$TIMEOUT" \
+    pi "${ARGS[@]}" "$PROMPT" </dev/null >"$RUN_DIR/result.jsonl" 2>"$RUN_DIR/stderr.log"
+fi
+PI_RC=$?
+END=$(date -u +%s)
+
+# pi exits 0 even when it never reached a model — verified: with no credentials it emits a
+# session header, prints the reason on stderr, and returns 0. So the exit code alone cannot
+# be trusted, and the outcome is judged from what the run actually produced.
+# Outcome, cost and tokens all come from the same pass over pi's stream. The schema, verified
+# against a real failure: assistant messages carry `stopReason` and, when something went
+# wrong, `errorMessage`; `usage.cost.total` is the money. `agent_end.messages` is the
+# authoritative list — message_end and turn_end repeat the same message, so summing those
+# would double-count every run's cost.
+read -r STATUS COST TOKENS < <(python3 - "$RUN_DIR/result.jsonl" "$RUN_DIR/stderr.log" "$PI_RC" "$RUN_DIR/error.txt" <<'PY'
+import json, sys
+res, err, rc, errout = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+
+msgs, fallback = [], []
+try:
+    for line in open(res, encoding='utf-8', errors='replace'):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get('type') == 'agent_end' and isinstance(ev.get('messages'), list):
+            msgs = ev['messages']
+        elif ev.get('type') == 'message_end':
+            m = ev.get('message') or {}
+            if m.get('role') == 'assistant':
+                fallback.append(m)
+except OSError:
+    pass
+if not msgs:
+    msgs = fallback
+
+produced, error_msg, cost, tokens = False, '', 0.0, 0
+for m in msgs:
+    if not isinstance(m, dict) or m.get('role') != 'assistant':
+        continue
+    u = m.get('usage') or {}
+    c = (u.get('cost') or {}).get('total')
+    if isinstance(c, (int, float)):
+        cost += c
+    t = u.get('totalTokens')
+    if isinstance(t, int):
+        tokens += t
+    if m.get('stopReason') == 'error':
+        error_msg = error_msg or str(m.get('errorMessage', ''))
+    content = m.get('content')
+    if isinstance(content, list) and any(
+            (p.get('text') or '').strip() for p in content if isinstance(p, dict)):
+        produced = True
+
+stderr = ''
+try:
+    stderr = open(err, encoding='utf-8', errors='replace').read()
+except OSError:
+    pass
+blob = (error_msg + ' ' + stderr).lower()
+if error_msg:
+    open(errout, 'w').write(error_msg[:2000])
+
+# Auth is a configuration fault and must never be retried; rate limits and overload are
+# transient and should be. A scheduler that cannot tell them apart either hammers a broken
+# credential or gives up on a busy provider.
+if rc in (124, 137):
+    status = 22
+elif any(s in blob for s in ('401', 'authentication', 'invalid x-api-key', 'invalid api key',
+                             'no api key', 'unauthorized', '403', 'permission')):
+    status = 20
+elif any(s in blob for s in ('429', 'rate limit', 'overloaded', 'capacity', '529',
+                             '500', '502', '503', 'timeout', 'econnreset')):
+    status = 21
+elif produced:
+    status = 0
+elif rc != 0:
+    status = 40
+else:
+    status = 30
+print(status, round(cost, 6), tokens)
+PY
+)
+[ -n "${STATUS:-}" ] || STATUS=40
+[ -n "${COST:-}" ] || COST=0
+[ -n "${TOKENS:-}" ] || TOKENS=0
+
+python3 - "$RUN_DIR/meta.json" "$JOB" "$RUN_ID" "$STAMP" "$START" "$END" "$STATUS" "$PI_RC" "$MCP_SERVERS" "$TOOL_LIST" "$COST" "$TOKENS" "$RUN_DIR/error.txt" <<'PY'
+import json, os, sys
+p, job, rid, stamp, start, end, status, rc, mcp, tools, cost, tokens, errf = sys.argv[1:14]
+err = ""
+if os.path.isfile(errf):
+    err = open(errf, encoding='utf-8', errors='replace').read().strip()[:300]
+json.dump({
+    "job": job, "run_id": rid, "started_utc": stamp,
+    "duration_s": int(end) - int(start),
+    "exit": int(status), "pi_exit": int(rc),
+    "cost_usd": float(cost), "tokens": int(tokens),
+    "tools": [t for t in tools.split(',') if t],
+    "mcp": mcp.split() if mcp else [],
+    "error": err,
+}, open(p, 'w'), indent=2)
+PY
+
+# One append-only line per run: the timeline something other than a human can read.
+python3 - "$DATA/logs/runs.jsonl" "$RUN_DIR/meta.json" "$RUN_DIR" <<'PY'
+import json, sys
+line = json.load(open(sys.argv[2]))
+line["dir"] = sys.argv[3]
+with open(sys.argv[1], 'a') as fh:
+    fh.write(json.dumps(line) + "\n")
+PY
+cp "$RUN_DIR/meta.json" "$RUNS/$JOB/last.json" 2>/dev/null
+
+if [ "$STATUS" != 0 ]; then
+  echo "agent-run: '$JOB' failed (exit $STATUS). Details: $RUN_DIR" >&2
+  sed -n '1,5p' "$RUN_DIR/stderr.log" >&2 2>/dev/null
+  # The container has no way to send anything by design, so alerting is the host's job.
+  [ -n "${AGENT_RUN_ALERT_CMD:-}" ] && $AGENT_RUN_ALERT_CMD "$RUN_DIR" >/dev/null 2>&1
+fi
+exit "$STATUS"

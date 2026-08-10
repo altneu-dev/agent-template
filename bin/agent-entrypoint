@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# agent-entrypoint — prepare /data, then do what the command says.
+#
+#   idle            prepare and stay up, so the container is a place to exec into (default)
+#   run <job>       prepare and run one job, then exit with that job's exit code
+#   <anything>      prepare and exec it
+#
+# `idle` is the default because this image is an appliance: the container is the deployment
+# unit and a scheduler (or a human) triggers work inside it. It sleeps as PID 1's child
+# under tini, so MCP server subprocesses get reaped rather than accumulating as zombies.
+set -uo pipefail
+
+agent-init || {
+  echo "entrypoint: /data could not be prepared — refusing to start an agent that would" >&2
+  echo "            write into the wrong place or lose its memory." >&2
+  exit 1
+}
+
+case "${1:-idle}" in
+  idle)
+    echo "agent: ready. /data prepared. Run a job with: agent-run <job>"
+    # Not `sleep infinity`: a container that cannot be signalled cleanly takes the full
+    # stop-timeout on every redeploy, which on a one-click platform is felt every push.
+    exec tail -f /dev/null
+    ;;
+  run)
+    shift
+    exec agent-run "$@"
+    ;;
+  *)
+    exec "$@"
+    ;;
+esac

@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# agent-mcp — turn this deployment's mcp/ definitions into a config the agent can use.
+#
+#   agent-mcp check           validate and report; exit 1 if anything is wrong
+#   agent-mcp probe [name..]  actually start each server and list the tools it offers
+#   agent-mcp print           the merged config, with variable-derived values redacted
+#   agent-mcp servers         server names, one per line
+#   agent-mcp tools [name..]  <server>__<tool> per line — what a job may put in `allow:`
+#   agent-mcp render          write the expanded config, print its path (used by agent-run)
+#
+# Why this exists: mcp/ was documented as an extension point long before anything read it.
+# A fork could ship definitions, follow the documentation exactly, and get an agent with no
+# MCP tools and no error message.
+#
+# Pi has no MCP support of its own — not a flag, not a settings key. It arrives through the
+# mcp-tools extension, which reads what this command renders and registers each tool the job
+# declared. So this file owns the part that must not be delegated: resolving ${VAR} from the
+# deployment's secrets and refusing to start when one is missing.
+#
+# Two rules shape everything below:
+#
+#   1. Definitions reference variables, never values (${VAR}), because anything in a COPY
+#      stays in an image layer forever. The values come from the secrets file at runtime.
+#   2. A secret must never reach the image, the volume, or a process argument list. The
+#      expanded config is therefore written to container-local tmpfs at mode 0600, and
+#      only its *path* is handed to the extension that registers the tools.
+#
+# Exit codes are the interface `agent` depends on:
+#   0  fine (for `render`: a config was written and its path is on stdout)
+#   1  something is wrong and was reported
+#   2  nothing to do — no definitions, or MCP switched off
+set -uo pipefail
+
+DATA_DIR="${AGENT_DATA:-/data}"
+APP_DIR="${AGENT_APP:-/app}"
+ENV_FILE="${AGENT_ENV_FILE:-$DATA_DIR/.env}"
+TEMPLATE_MCP="$APP_DIR/agent/mcp"
+MODE="${AGENT_MCP:-on}"          # on | optional | off
+
+usage() {
+  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Where the definitions live. The volume comes first: mcp/ is a template extension point,
+# so it is per-instance and editable, which is the whole reason it is seeded rather than
+# read from the image. The image path is a fallback for volumes seeded before this
+# directory existed — those need `agent-upgrade`, and we say so rather than silently
+# using a copy the operator cannot edit.
+MCP_DIR="${AGENT_MCP_DIR:-}"
+FELL_BACK=0
+if [ -z "$MCP_DIR" ]; then
+  if compgen -G "$DATA_DIR/mcp/*.json" >/dev/null 2>&1; then
+    MCP_DIR="$DATA_DIR/mcp"
+  elif compgen -G "$TEMPLATE_MCP/*.json" >/dev/null 2>&1; then
+    MCP_DIR="$TEMPLATE_MCP"
+    FELL_BACK=1
+  else
+    MCP_DIR="$DATA_DIR/mcp"
+  fi
+fi
+
+# Container-local and memory-backed. NOT $TMPDIR: entrypoint.sh points that at
+# $HOME/.cache/pi-tmp, which is the volume — bind-mounted and readable from the host. A
+# bare mktemp would put every expanded secret on disk where the file viewer can read it.
+RUNTIME_BASE="${AGENT_MCP_RUNTIME:-}"
+if [ -z "$RUNTIME_BASE" ]; then
+  if [ -w /dev/shm ]; then RUNTIME_BASE=/dev/shm; else RUNTIME_BASE=/tmp; fi
+fi
+RUNTIME_DIR="$RUNTIME_BASE/agent-mcp"
+
+# The PID the rendered file belongs to. agent-run passes its own $$, so the file is named
+# after the process that will read it and can be reaped by checking /proc. That is why there
+# is no EXIT trap here: a run can be killed by its own timeout, and a trap that never fires
+# would leave expanded secrets behind for the life of the container.
+RENDER_PID="${AGENT_MCP_PID:-$PPID}"
+
+CMD="${1:-check}"
+[ $# -gt 0 ] && shift
+
+case "$CMD" in
+  check|probe|print|servers|render|tools) ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) echo "agent-mcp: unknown command '$CMD'" >&2; usage >&2; exit 2 ;;
+esac
+
+if [ "$MODE" = "off" ]; then
+  [ "$CMD" = "render" ] || echo "agent-mcp: disabled (AGENT_MCP=off)"
+  exit 2
+fi
+
+# One python program for every mode. The shell above resolves paths and policy; the JSON
+# merging, ${VAR} expansion and MCP handshake all need real parsing, and bin/kb already
+# established the embedded-python idiom for exactly that reason.
+python3 - "$CMD" "$MCP_DIR" "$ENV_FILE" "$RUNTIME_DIR" "$RENDER_PID" "$MODE" "$FELL_BACK" "$@" <<'PY'
+import glob, json, os, re, shlex, signal, stat, subprocess, sys
+
+cmd, mcp_dir, env_file, runtime_dir, render_pid, mode, fell_back = sys.argv[1:8]
+wanted = sys.argv[8:]
+fell_back = fell_back == "1"
+
+out, err = [], []
+def say(m):  out.append(m)
+def warn(m): err.append("agent-mcp: " + m)
+
+# ---------------------------------------------------------------- the secrets file
+#
+# Parsed, never sourced. `set -a; . ~/.env` executes arbitrary shell from a file and puts
+# every secret into this process's environment, and from there into /proc/<pid>/environ of
+# every descendant — including whatever an MCP server subprocess turns out to be. Reading
+# only the variables the definitions actually reference keeps that surface to the minimum.
+#
+# The grammar is deliberately boring: KEY=value, optional leading `export`, # comments,
+# blank lines, matching surrounding quotes stripped. No command substitution, no line
+# continuation, no multi-line values.
+ENV_LINE = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$')
+
+def load_env(path):
+    values, source, problems = {}, {}, []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for n, line in enumerate(fh, 1):
+                if not line.strip() or line.lstrip().startswith('#'):
+                    continue
+                m = ENV_LINE.match(line.rstrip('\n'))
+                if not m:
+                    continue
+                k, v = m.group(1), m.group(2)
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                    v = v[1:-1]                       # quoted: literal, '#' included
+                elif v[:1] in ('"', "'"):
+                    # An unmatched quote means the value continues on the next line, which
+                    # this parser does not support. Silently taking the first line would
+                    # hand a truncated credential to a server and produce an auth error
+                    # nobody could trace back to here.
+                    problems.append(f"{os.path.basename(path)}:{n}: {k} looks like a "
+                                    f"multi-line value — not supported; put it on one line")
+                    continue
+                else:
+                    # Unquoted: a trailing comment is not part of the value. Requires
+                    # whitespace before '#', so a value containing '#' survives.
+                    v = re.sub(r'\s+#.*$', '', v).rstrip()
+                values[k], source[k] = v, 'secrets file'
+    except FileNotFoundError:
+        return values, source, problems, False
+    except OSError as e:
+        problems.append(f"cannot read {path}: {e}")
+        return values, source, problems, False
+    return values, source, problems, True
+
+env_values, env_source, env_problems, env_present = load_env(env_file)
+
+def lookup(name):
+    if name in env_values:
+        return env_values[name], env_source[name]
+    if name in os.environ:              # so ${AGENT_PROJECT} and friends resolve at all
+        return os.environ[name], 'env'
+    return None, None
+
+# ---------------------------------------------------------------- merge the definitions
+#
+# One file per connection, merged into one config. We have to produce derived content
+# anyway (expansion), duplicate server names are only detectable by merging, and the
+# precedence of `--mcp-config a.json b.json` is not documented and not verifiable against
+# a compiled binary — so a duplicate is an error naming both files rather than a silent
+# last-wins. Everything except mcpServers is dropped, so a stray "_comment" never reaches
+# the agent. Note the glob is *.json, so editor backups and .disabled files are ignored.
+files = sorted(glob.glob(os.path.join(mcp_dir, '*.json')))
+servers, origin, fatal = {}, {}, []
+
+for f in files:
+    try:
+        with open(f, encoding='utf-8') as fh:
+            doc = json.load(fh)
+    except json.JSONDecodeError as e:
+        fatal.append(f"{f}: invalid JSON at line {e.lineno} column {e.colno}: {e.msg}")
+        continue
+    except OSError as e:
+        fatal.append(f"{f}: {e}")
+        continue
+    if not isinstance(doc, dict) or not isinstance(doc.get('mcpServers'), dict):
+        # A file in mcp/ without mcpServers is a mistake, not a feature. Skipping it
+        # quietly is how a fork ends up with a connection that never existed.
+        fatal.append(f"{f}: no top-level \"mcpServers\" object")
+        continue
+    for name, spec in doc['mcpServers'].items():
+        if name in servers:
+            fatal.append(f"duplicate server \"{name}\" in {origin[name]} and {f}")
+            continue
+        servers[name], origin[name] = spec, f
+
+# ---------------------------------------------------------------- ${VAR} expansion
+#
+# ${VAR} and ${VAR:-default} only. Braceless $VAR is deliberately unsupported: `$` occurs
+# in real secret values (regexes, generated passwords), and treating those as references
+# would corrupt them silently. \${ escapes to a literal ${.
+REF = re.compile(r'(?<!\\)\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}')
+
+missing, used = [], {}
+
+def expand(value, where, redact=False):
+    """Substitute in one string. Records what was referenced and what was not found."""
+    def sub(m):
+        name, default = m.group(1), m.group(2)
+        val, src = lookup(name)
+        if val is None:
+            if default is not None:
+                # Not redacted: a default is written in the definition file itself, so it
+                # is already non-secret by construction — showing it is the useful thing.
+                used.setdefault(name, 'default')
+                return default
+            missing.append((name, where))
+            used.setdefault(name, None)
+            return m.group(0)
+        used.setdefault(name, src)
+        # Redaction replaces the value with the variable name, so `print` can never emit a
+        # credential even if someone pipes it into a log.
+        return f"<{name}>" if redact else val
+    return REF.sub(sub, value).replace('\\${', '${')
+
+def walk(node, where, redact=False):
+    if isinstance(node, dict):
+        return {walk(k, where, redact): walk(v, f"{where}.{k}", redact) for k, v in node.items()}
+    if isinstance(node, list):
+        return [walk(v, f"{where}[{i}]", redact) for i, v in enumerate(node)]
+    if isinstance(node, str):
+        return expand(node, where, redact)
+    return node
+
+def build(redact=False):
+    del missing[:]
+    used.clear()
+    return {n: walk(spec, f"mcpServers.{n}", redact) for n, spec in servers.items()}
+
+# ---------------------------------------------------------------- reporting helpers
+def nothing_to_do():
+    # Prints directly rather than through say(): only `check` flushes the buffer, and this
+    # runs for every command.
+    if cmd in ('render', 'servers'):
+        sys.exit(2 if cmd == 'render' else 0)
+    if not os.path.isdir(mcp_dir):
+        print(f"no {mcp_dir} — nothing to load.")
+    else:
+        print(f"no *.json in {mcp_dir} — no MCP servers configured.")
+    print("")
+    print("A definition is one JSON file per connection, referencing variables never values:")
+    print('  { "mcpServers": { "name": { "command": "npx", "args": ["-y", "pkg"],')
+    print('                              "env": { "TOKEN": "${TOKEN}" } } } }')
+    print("")
+    sys.exit(0)
+
+if not files:
+    nothing_to_do()
+
+if fatal:
+    for m in fatal:
+        print("agent-mcp: " + m, file=sys.stderr)
+    sys.exit(1)
+
+expanded = build()
+
+# Missing variables stop the agent before it starts. A server that launches without its
+# credential fails later, inside a run, as an opaque auth error — which is the failure this
+# whole file exists to prevent. AGENT_MCP=optional downgrades it to dropping the server.
+def server_of(where):
+    """"mcpServers.jira.env.JIRA_TOKEN" -> "jira"."""
+    parts = where.split('.')
+    return parts[1] if len(parts) > 1 and parts[0] == 'mcpServers' else None
+
+if missing:
+    by_name = {}
+    for name, where in missing:
+        by_name.setdefault(name, []).append(where)
+
+    if mode == 'optional':
+        dropped = []
+        for name, wheres in sorted(by_name.items()):
+            for w in wheres:
+                srv = server_of(w)
+                if srv and srv in expanded:
+                    del expanded[srv]
+                    dropped.append((srv, name))
+        for srv, name in dropped:
+            warn(f'dropped server "{srv}": {name} is not set (AGENT_MCP=optional)')
+        if not expanded and cmd == 'render':
+            # Say why before leaving: "no MCP servers" without a reason is the silent
+            # failure this command was written to remove.
+            for m in err: print(m, file=sys.stderr)
+            sys.exit(2)
+    elif cmd != 'print':
+        whence = '~/.env' if env_present else f'{env_file} (the secrets file is not mounted)'
+        print(f"missing (referenced in {mcp_dir}, not in {whence}):", file=sys.stderr)
+        for name, wheres in sorted(by_name.items()):
+            srv = server_of(wheres[0])
+            src = os.path.basename(origin[srv]) if srv in origin else '?'
+            print(f"  {name:<24} ({src} → {wheres[0]})", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Fix on the host in /opt/secrets/<project>.env, then: docker restart proj-<project>",
+              file=sys.stderr)
+        print("Or: AGENT_MCP=optional (drop that server) / AGENT_MCP=off (skip MCP entirely)",
+              file=sys.stderr)
+        sys.exit(1)
+
+for m in env_problems:
+    warn(m)
+
+# ---------------------------------------------------------------- commands
+if cmd == 'servers':
+    for n in sorted(expanded):
+        print(n)
+    sys.exit(0)
+
+if cmd == 'print':
+    print(json.dumps({"mcpServers": build(redact=True)}, indent=2))
+    sys.exit(0)
+
+if cmd == 'check':
+    if fell_back:
+        say(f"using {mcp_dir} from the image — this volume has no ~/mcp/.")
+        say("  Run `agent-upgrade` to get an editable copy in the volume.")
+        say("")
+    say(f"{len(files)} file(s), {len(expanded)} server(s): " + ", ".join(sorted(expanded)))
+    if used:
+        say("")
+        say("variables:")
+        for name in sorted(used):
+            src = used[name]
+            say(f"  {name:<24} {src if src else 'MISSING'}")
+    # A value that still contains ${ after expansion is either a typo or a variable the
+    # renderer could not see. Either way the server would receive a literal '${...}' and
+    # fail somewhere less obvious than here.
+    leftovers = [n for n, s in expanded.items() if '${' in json.dumps(s)]
+    if leftovers:
+        warn("still contains ${...} after expansion: " + ", ".join(leftovers))
+    # Definitions must reference variables, never values. A literal credential here is in
+    # the image layer forever, also after it is deleted.
+    literal = re.compile(r'(ghp_[A-Za-z0-9]{20}|github_pat_[A-Za-z0-9_]{20}|sk-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16})')
+    for n, spec in servers.items():
+        if literal.search(json.dumps(spec)):
+            warn(f"\"{n}\" ({os.path.basename(origin[n])}) contains a literal credential — "
+                 f"use ${{VAR}} and put the value in the secrets file")
+    say("")
+    say("Jobs reach these through their `mcp:` and `allow:` declarations.")
+    for m in out: print(m)
+    for m in err: print(m, file=sys.stderr)
+    sys.exit(1 if err else 0)
+
+if cmd == 'render':
+    # Reap first: any file whose process is gone. This replaces an EXIT trap, which a
+    # timed-out run would never fire.
+    try:
+        os.makedirs(runtime_dir, mode=0o700, exist_ok=True)
+        os.chmod(runtime_dir, 0o700)
+    except OSError as e:
+        print(f"agent-mcp: cannot create {runtime_dir}: {e}", file=sys.stderr)
+        sys.exit(1)
+    st = os.lstat(runtime_dir)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+        print(f"agent-mcp: {runtime_dir} is not a directory owned by this user", file=sys.stderr)
+        sys.exit(1)
+    for old in glob.glob(os.path.join(runtime_dir, '*.json')):
+        pid = os.path.basename(old)[:-5]
+        if pid.isdigit() and not os.path.exists(f"/proc/{pid}"):
+            try: os.unlink(old)
+            except OSError: pass
+
+    target = os.path.join(runtime_dir, f"{render_pid}.json")
+    tmp = target + ".tmp"
+    old_umask = os.umask(0o077)
+    try:
+        # 0600 before any content is written: a half-written config must never be readable.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as fh:
+            json.dump({"mcpServers": expanded}, fh)
+        os.replace(tmp, target)
+    except OSError as e:
+        print(f"agent-mcp: cannot write {target}: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        os.umask(old_umask)
+    for m in err: print(m, file=sys.stderr)
+    # Which servers a run actually got is worth one line in its stderr: a server that
+    # quietly failed to load is otherwise indistinguishable from one that loaded and had
+    # nothing to say.
+    print("agent-mcp: %d server(s): %s" % (
+        len(expanded), ", ".join(sorted(expanded))), file=sys.stderr)
+    print(target)
+    sys.exit(0)
+
+if cmd in ('probe', 'tools'):
+    # The strongest check available without a model: start each stdio server and complete
+    # a real MCP handshake, which is the only check that proves a server actually works
+    # rather than that its definition parses.
+    def on_alarm(signum, frame):
+        raise TimeoutError("no answer within the timeout")
+    signal.signal(signal.SIGALRM, on_alarm)
+
+    def handshake(p):
+        """initialize -> notifications/initialized -> tools/list. Returns the tool names."""
+        def send(obj):
+            p.stdin.write(json.dumps(obj) + "\n")
+            p.stdin.flush()
+
+        def await_id(want, during):
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    raise RuntimeError(f"server closed the connection during {during}")
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue          # servers sometimes log to stdout before speaking
+                if msg.get('id') == want:
+                    if 'error' in msg:
+                        raise RuntimeError(f"{during}: {msg['error'].get('message', msg['error'])}")
+                    return msg
+
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "agent-mcp", "version": "1"}}})
+        await_id(1, "initialize")
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        msg = await_id(2, "tools/list")
+        return [t.get('name') for t in msg.get('result', {}).get('tools', [])]
+
+    names = wanted or sorted(expanded)
+    failures = 0
+    for name in names:
+        spec = expanded.get(name)
+        if spec is None:
+            print(f"{name}: no such server", file=sys.stderr)
+            failures += 1
+            continue
+        if not spec.get('command'):
+            if cmd == 'tools':
+                continue
+            # http/sse servers carry a url instead. Contacting one is a network call with a
+            # real credential, which is not something a local validation command should do
+            # behind the operator's back.
+            print(f"{name}: remote server ({spec.get('url') or spec.get('type') or 'no command'}) — not probed")
+            continue
+
+        argv = [str(spec['command'])] + [str(a) for a in (spec.get('args') or [])]
+        child_env = dict(os.environ)
+        child_env.update({k: str(v) for k, v in (spec.get('env') or {}).items()})
+        try:
+            p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, env=child_env, text=True,
+                                 bufsize=1, cwd=os.path.expanduser('~'))
+        except OSError as e:
+            print(f"{name}: cannot start {shlex.join(argv)}: {e}", file=sys.stderr)
+            failures += 1
+            continue
+
+        signal.alarm(int(os.environ.get('AGENT_MCP_TIMEOUT', '20')))
+        try:
+            tools = handshake(p)
+            signal.alarm(0)
+            if cmd == 'tools':
+                for t in tools:
+                    print(f"{name}__{t}")
+            else:
+                print(f"{name}: ok — " + (f"{len(tools)} tool(s): " + ", ".join(tools)
+                                          if tools else "no tools advertised"))
+        except (TimeoutError, RuntimeError, OSError) as e:
+            signal.alarm(0)
+            print(f"{name}: {e}", file=sys.stderr)
+            failures += 1
+        finally:
+            signal.alarm(0)
+            try:
+                p.kill()
+                p.wait(timeout=5)
+                # The server's own stderr is usually the only thing that explains a failure
+                # ("module not found", "invalid token"). Worth surfacing, bounded.
+                tail = (p.stderr.read() or "").strip().splitlines()[-3:]
+                for line in tail:
+                    print(f"    {name}: {line}", file=sys.stderr)
+            except Exception:
+                pass
+    for m in err: print(m, file=sys.stderr)
+    sys.exit(1 if failures else 0)
+PY

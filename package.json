@@ -1,0 +1,11 @@
+{
+  "name": "agent-template",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Deployable agent: harness, tools, guardrails, memory and observability in one repo.",
+  "type": "module",
+  "comment": "mcporter is a dependency rather than a global install because pi resolves an extension's imports from the node_modules beside it. A global install would leave `import { createRuntime } from 'mcporter'` unresolvable at run time — and the failure would only appear once a job actually declared an MCP server.",
+  "dependencies": {
+    "mcporter": "0.13.2"
+  }
+}

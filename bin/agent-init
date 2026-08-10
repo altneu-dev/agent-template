@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# agent-init — make /data usable. Idempotent, safe to run at any time, never destructive.
+#
+#   agent-init            prepare /data
+#   agent-init --check    report what it would do, change nothing (exit 1 if not ready)
+#
+# Why this is a command and not just entrypoint code: a platform supervisor may replace the
+# container's start command — OpenShell does exactly that — and anything load-bearing that
+# only ever ran from an entrypoint would then silently not run at all. The entrypoint calls
+# this; so can a human, a job, or a supervisor.
+#
+# The layout it creates is the /app vs /data split:
+#
+#   symlinks into /app   AGENTS.md, context, skills, jobs, mcp, extensions
+#                        Repo content. Always current after a deploy, because they point at
+#                        the image rather than being copied once and then going stale — the
+#                        failure that made the previous generation ship `.new` files for a
+#                        human to merge by hand.
+#   real directories     knowledge/notes, logs/runs, work, .pi
+#                        State. Seeded once from the repo, then owned by the agent.
+set -uo pipefail
+
+APP="${AGENT_APP:-/app}"
+DATA="${AGENT_DATA:-/data}"
+CHECK=0
+[ "${1:-}" = "--check" ] && CHECK=1
+
+problems=0
+pending=0
+note()  { [ "$CHECK" = 1 ] && echo "  $*"; }
+# Anything --check would have done means /data is not ready yet. Counting those separately
+# from failures is what lets --check double as a readiness probe for CI and healthchecks.
+todo()  { pending=$((pending + 1)); note "$*"; }
+fail()  { echo "agent-init: $*" >&2; problems=$((problems + 1)); }
+
+if [ ! -d "$DATA" ]; then
+  fail "$DATA does not exist"
+  exit 1
+fi
+if [ "$CHECK" = 0 ] && [ ! -w "$DATA" ]; then
+  # The classic container mistake: a volume owned by a uid the container does not run as.
+  fail "$DATA is not writable by uid $(id -u) — check the volume's ownership"
+  exit 1
+fi
+
+# --- state: create once, never touch again ------------------------------------------
+for d in knowledge/notes logs/runs work .pi/agent; do
+  if [ -d "$DATA/$d" ]; then
+    note "exists: $d"
+  elif [ "$CHECK" = 1 ]; then
+    todo "would create: $d"
+  else
+    mkdir -p "$DATA/$d" || fail "cannot create $DATA/$d"
+  fi
+done
+
+# --- repo content: symlink, so a deploy updates it ----------------------------------
+# A real file that a fork later changes would go stale here forever, because seeding only
+# ever happens once. Pointing at /app means `git push` is the update mechanism.
+link() {
+  local target="$1" name="$2" path="$DATA/$2"
+  [ -e "$target" ] || { note "skip (absent in image): $name"; return 0; }
+  if [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ]; then
+    note "linked: $name"
+    return 0
+  fi
+  if [ -e "$path" ] && [ ! -L "$path" ]; then
+    # Someone put a real file where a link belongs. Do not delete their work.
+    fail "$path is a real file, not a link to $target — move it aside to let the image own it"
+    return 0
+  fi
+  [ "$CHECK" = 1 ] && { todo "would link: $name -> $target"; return 0; }
+  ln -sfn "$target" "$path" || fail "cannot link $path"
+}
+
+link "$APP/agent/AGENTS.md"   AGENTS.md
+link "$APP/agent/context"     context
+link "$APP/agent/skills"      skills
+link "$APP/agent/jobs"        jobs
+link "$APP/agent/mcp"         mcp
+link "$APP/agent/extensions"  extensions
+
+# --- seed the knowledge base, without ever overwriting ------------------------------
+# The repo may ship starting material. It is copied in only where nothing exists, so an
+# agent's own notes always win over the image's copy.
+if [ -d "$APP/knowledge/notes" ]; then
+  while IFS= read -r src; do
+    rel="${src#"$APP/knowledge/notes/"}"
+    dst="$DATA/knowledge/notes/$rel"
+    [ -e "$dst" ] && continue
+    if [ "$CHECK" = 1 ]; then todo "would seed: knowledge/notes/$rel"; continue; fi
+    mkdir -p "$(dirname "$dst")" 2>/dev/null
+    cp "$src" "$dst" 2>/dev/null || fail "cannot seed $rel"
+  done < <(find "$APP/knowledge/notes" -type f -name '*.md' 2>/dev/null)
+fi
+
+# --- pi settings: seed once, then the instance owns them ----------------------------
+if [ -f "$APP/agent/pi-settings.json" ] && [ ! -f "$DATA/.pi/agent/settings.json" ]; then
+  if [ "$CHECK" = 1 ]; then
+    todo "would seed: .pi/agent/settings.json"
+  else
+    cp "$APP/agent/pi-settings.json" "$DATA/.pi/agent/settings.json" 2>/dev/null \
+      || fail "cannot seed pi settings"
+  fi
+fi
+
+[ "$problems" -gt 0 ] && exit 1
+if [ "$CHECK" = 1 ]; then
+  if [ "$pending" -gt 0 ]; then
+    echo "agent-init: $DATA is not ready — $pending item(s) above still to do"
+    exit 1
+  fi
+  echo "agent-init: $DATA is ready"
+fi
+exit 0

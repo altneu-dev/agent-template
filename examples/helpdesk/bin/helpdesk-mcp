@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+# helpdesk-mcp — a stdio MCP server over a ticket store.
+#
+# A vertical ships its own tool server when no third-party one has the right SURFACE. That is
+# the point: this server has `list_open` and `add_note`, and no `delete_ticket` — so deletion
+# is not something to be restricted later, it is something that does not exist.
+#
+# Stdlib only, so it needs no install step and runs on any architecture.
+import json, os, sys
+
+STORE = os.environ.get("HELPDESK_STORE", "/data/work/helpdesk/tickets.json")
+
+def load():
+    try:
+        return json.load(open(STORE, encoding="utf-8"))
+    except Exception:
+        return [{"id": 1, "subject": "Printer offline", "status": "open", "notes": []}]
+
+def reply(i, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": i, "result": result}) + "\n"); sys.stdout.flush()
+
+TOOLS = [
+    {"name": "list_open", "description": "List open tickets.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "add_note", "description": "Append a note to a ticket. Never closes it.",
+     "inputSchema": {"type": "object",
+                     "properties": {"id": {"type": "integer"}, "note": {"type": "string"}},
+                     "required": ["id", "note"]}},
+]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        m = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    mid, method = m.get("id"), m.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        reply(mid, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "helpdesk-mcp", "version": "1"}})
+    elif method == "tools/list":
+        reply(mid, {"tools": TOOLS})
+    elif method == "tools/call":
+        p = m.get("params") or {}
+        if p.get("name") == "list_open":
+            open_ = [t for t in load() if t.get("status") == "open"]
+            reply(mid, {"content": [{"type": "text", "text": json.dumps(open_)}]})
+        else:
+            reply(mid, {"content": [{"type": "text", "text": "noted"}]})
+    else:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                     "error": {"code": -32601, "message": "no such method"}}) + "\n")
+        sys.stdout.flush()

@@ -1,0 +1,50 @@
+# One service, one volume. Coolify, Dokploy and plain `docker compose up` all read this,
+# which is what keeps the deploy story to: point a platform at the repo, paste the env vars,
+# click once.
+services:
+  agent:
+    build:
+      context: .
+      args:
+        AGENT_UID: "${AGENT_UID:-1000}"
+        AGENT_GID: "${AGENT_GID:-1000}"
+    restart: unless-stopped
+
+    # THE line that matters. /data is the agent's memory — knowledge notes, run logs, work
+    # area, pi sessions. A redeploy replaces the container and keeps this. Remove it and the
+    # agent forgets everything every time you push.
+    volumes:
+      - agent-data:/data
+
+    # Secrets arrive from the platform's secret store. .env.example lists every name; the
+    # deploy fails loudly at preflight rather than mid-run when one is missing.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AGENT_NAME: "${AGENT_NAME:-agent}"
+      TZ: "${TZ:-Europe/Berlin}"
+
+    # Nothing is published. This agent reaches out; nothing reaches in. Adding a port here
+    # is the single easiest way to undo the containment story, so it is absent on purpose.
+
+    # Guardrails that cost nothing and are absent from most compose files:
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true          # /app is immutable at runtime; only /data and /tmp are writable
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    pids_limit: 512
+    mem_limit: 2g
+    mem_swappiness: 0
+    cpus: 2.0
+    ulimits:
+      nofile: { soft: 4096, hard: 8192 }
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  agent-data:
