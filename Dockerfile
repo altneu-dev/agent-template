@@ -54,6 +54,10 @@ RUN if [ "${AGENT_GID}" != "1000" ]; then groupadd -g "${AGENT_GID}" agent; fi \
 COPY bin/ /app/bin/
 COPY agent/ /app/agent/
 COPY knowledge/ /app/knowledge/
+# The deploy checklist. Without it in the image, agent-secret cannot say what this
+# deployment requires, so preflight passes on a container that is not configured at all and
+# the exit-10 promise ("nothing was run and nothing was spent") never fires.
+COPY .env.example /app/.env.example
 RUN chmod +x /app/bin/*
 
 # /data is a mountpoint. Creating it here with the right owner means the container also

@@ -58,15 +58,27 @@ jobs:
       - name: The harness works inside the image
         run: |
           set -e
+          # Output is captured rather than piped: `| grep -q` closes the pipe as soon as it
+          # matches, and the container process then dies of SIGPIPE mid-write, which shows up
+          # as "broken pipe" noise next to a real failure.
           run() { docker run --rm -v ci-data:/data agent-template:ci "$@"; }
+
+          # The deploy checklist must be IN the image. Without it agent-secret cannot say what
+          # this deployment requires and preflight approves an unconfigured container — the
+          # bug this job caught on its first run.
+          run test -f /app/.env.example
+
           run agent-init --check
           run agent-run --list
-          run agent-mcp check | grep -q "no MCP servers configured"
-          run kb schema | grep -q "SQLite FTS5"
-          # An unconfigured deployment must refuse before spending anything, and say which
-          # variable is missing rather than failing inside a run.
-          if run agent-secret check -q; then echo "expected an unconfigured deployment to fail"; exit 1; fi
-          run agent-secret check | grep -q ANTHROPIC_API_KEY
+          echo "$(run agent-mcp check)"  | grep -q "no MCP servers configured"
+          echo "$(run kb schema)"        | grep -q "SQLite FTS5"
+
+          # An unconfigured deployment must refuse before spending anything, and name the
+          # variable rather than failing somewhere inside a run.
+          if run agent-secret check -q; then
+            echo "expected an unconfigured deployment to fail preflight"; exit 1
+          fi
+          echo "$(run agent-secret check || true)" | grep -q ANTHROPIC_API_KEY
           echo "harness ok"
 
       # THE test. /data is the agent's memory; if a redeploy loses it the agent forgets
