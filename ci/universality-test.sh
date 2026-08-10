@@ -27,7 +27,7 @@ no()   { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 # Everything a vertical must never need to change.
 FRAMEWORK=(
   bin/agent-init bin/agent-run bin/agent-mcp bin/agent-secret bin/agent-status
-  bin/agent-entrypoint agent/extensions/mcp-tools.ts agent/AGENTS.md
+  bin/agent-entrypoint bin/kb agent/extensions/mcp-tools.ts agent/AGENTS.md
   Dockerfile compose.yml package.json
 )
 
@@ -79,6 +79,15 @@ for example in "$REPO"/examples/*/; do
 
   agent-secret check -q && ok "deployment reports itself configured" \
                         || no "agent-secret check failed"
+
+  # AGENTS.md instructs the agent to use kb. A documented command that does not exist is the
+  # exact failure this repo was written to stop repeating, so it is asserted rather than assumed.
+  if kb add "gate probe" </dev/null >/dev/null 2>&1 && kb index >/dev/null 2>&1 \
+     && kb search "gate probe" >/dev/null 2>&1; then
+    ok "memory works: kb add / index / search"
+  else
+    no "kb round trip failed — AGENTS.md tells the agent to use it"
+  fi
 
   if [ -n "$(find "$work/agent/mcp" -name '*.json' 2>/dev/null)" ]; then
     agent-mcp check >/dev/null 2>&1 && ok "MCP definitions resolve" || no "agent-mcp check failed"

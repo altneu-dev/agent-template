@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Everything that needs no container. Fast, and it is where most mistakes surface.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Scripts parse
+        run: |
+          set -e
+          for f in bin/* ci/*.sh examples/*/bin/*; do
+            case "$f" in *.ts) continue;; esac
+            if head -1 "$f" | grep -q python; then python3 -m py_compile "$f"
+            else bash -n "$f"; fi
+          done
+          echo "all scripts parse"
+
+      - name: No values in .env.example
+        run: |
+          # It is committed, so a real credential here is public the moment it lands. Names and
+          # non-secret defaults only; <required> marks what an operator must supply.
+          if grep -vE '^\s*(#|$)' .env.example | grep -qiE '(sk-[A-Za-z0-9]{20}|ghp_[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16})'; then
+            echo "a credential-shaped value is committed in .env.example"; exit 1
+          fi
+          echo ".env.example carries no values"
+
+      - name: Install the runtime, as the image does
+        run: |
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund
+          npm install -g --ignore-scripts \
+            "@earendil-works/pi-coding-agent@$(grep -oP 'ARG PI_VERSION=\K[0-9.]+' Dockerfile)"
+
+      # The gate. Installs each example vertical and fails if a framework file moved, then
+      # asks pi itself what tool surface each job really gets. Needs no credentials: the probe
+      # extension reports on session_start, before any model request.
+      - name: Universality gate
+        run: ci/universality-test.sh
+
+  # The half that cannot be checked without a container — including the one property the whole
+  # design rests on.
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t agent-template:ci .
+
+      - name: The harness works inside the image
+        run: |
+          set -e
+          run() { docker run --rm -v ci-data:/data agent-template:ci "$@"; }
+          run agent-init --check
+          run agent-run --list
+          run agent-mcp check | grep -q "no MCP servers configured"
+          run kb schema | grep -q "SQLite FTS5"
+          # An unconfigured deployment must refuse before spending anything, and say which
+          # variable is missing rather than failing inside a run.
+          if run agent-secret check -q; then echo "expected an unconfigured deployment to fail"; exit 1; fi
+          run agent-secret check | grep -q ANTHROPIC_API_KEY
+          echo "harness ok"
+
+      # THE test. /data is the agent's memory; if a redeploy loses it the agent forgets
+      # everything, and every other guarantee in this repo is worth nothing. Recreating the
+      # container while keeping the volume is exactly what a platform does on `git push`.
+      - name: Memory survives a redeploy
+        run: |
+          set -e
+          docker run --rm -v ci-data:/data agent-template:ci \
+            sh -lc 'agent-init && kb add "survives a redeploy" </dev/null >/dev/null && kb index >/dev/null'
+          docker rm -f $(docker ps -aq --filter ancestor=agent-template:ci) 2>/dev/null || true
+          docker rmi -f agent-template:ci
+          docker build -q -t agent-template:ci .
+          docker run --rm -v ci-data:/data agent-template:ci \
+            sh -lc 'agent-init && kb search "survives redeploy"' | grep -q "survives a redeploy"
+          echo "memory survived an image rebuild and a new container"
+
+      - name: No credentials in the image
+        run: |
+          if docker history --no-trunc agent-template:ci \
+             | grep -qiE "sk-[A-Za-z0-9]{20}|ghp_[A-Za-z0-9]{20}"; then
+            echo "credential-shaped string in image history"; exit 1
+          fi
+          echo "image history clean"

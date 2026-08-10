@@ -100,6 +100,7 @@ ci/universality-test.sh   # installs each example and asserts the framework was 
 | `agent-mcp` | resolves `${VAR}` from secrets into an MCP config, 0600, in tmpfs |
 | `agent-secret` | reads one value from env or file — parsed, never sourced |
 | `agent-status` | what the agent has been doing |
+| `kb` | the memory: FTS5 over `knowledge/`, `context/` and `work/`, plus a one-line-per-document index |
 
 Secrets are read one at a time and reach the model process through its own environment only —
 never `--api-key` (which would put them in `ps`), never a wholesale `source` (which would put
