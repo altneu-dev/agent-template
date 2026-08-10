@@ -12,17 +12,24 @@
 #
 # Exit codes are the interface a scheduler consumes:
 #
-#    0  ran, produced a result
+#    0  ran, produced a result, and met the outcome contract
 #   10  preflight failed — configuration is wrong. NO model call was made, nothing was spent
 #   11  another run of this job is in progress
 #   20  provider or authentication error — configuration is wrong, do NOT retry
 #   21  provider temporarily unavailable (rate limit, overload) — safe to retry
 #   22  timed out
 #   30  ran, but produced no result
+#   31  ran and claimed to be done, but the outcome contract was not met
 #   40  internal error
 #
 # 10 is the important one: a misconfigured deployment must cost nothing and must say which
 # variable is missing, rather than failing somewhere inside a run with an opaque auth error.
+#
+# 31 is the other one. Exit 0 used to mean "the model finished", not "the task was done" —
+# and a confidently wrong answer is the failure agent/AGENTS.md names as the worst kind. A job
+# can now declare what its work must leave behind, and the harness checks it rather than
+# taking the model's word. Kept distinct from 30 because they need opposite responses: 30 is
+# usually the provider, 31 is the agent.
 set -uo pipefail
 
 APP="${AGENT_APP:-/app}"
@@ -98,6 +105,11 @@ out = {
     'JOB_MODEL':   meta.get('model', ''),
     'JOB_PROVIDER':meta.get('provider', ''),
     'JOB_THINKING':meta.get('thinking', ''),
+    # The outcome contract. Newline-joined rather than space-joined like mcp/skills: these are
+    # paths, and a client's directory names contain spaces sooner or later.
+    'JOB_REQUIRES':'\n'.join(listv('requires')),
+    'JOB_PRODUCES':'\n'.join(listv('produces')),
+    'JOB_VERIFY':  meta.get('verify', ''),
     'JOB_PROMPT':  body.strip(),
 }
 for k, v in out.items():
@@ -117,6 +129,10 @@ TIMEOUT="${JOB_TIMEOUT:-$(cfg AGENT_RUN_TIMEOUT 900)}"
 PROVIDER="${JOB_PROVIDER:-$(cfg AGENT_PROVIDER)}"
 MODEL="${JOB_MODEL:-$(cfg AGENT_MODEL)}"
 
+# Contract paths are relative to /data — the volume, where a job's work lives — unless the job
+# gives an absolute one.
+abspath() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$DATA" "$1" ;; esac; }
+
 # ---------------------------------------------------------------- preflight (costs nothing)
 if [ "$DRY" = 0 ]; then
   agent-init || exit 10
@@ -131,6 +147,36 @@ if [ "$DRY" = 0 ]; then
     echo "agent-run: MCP is not usable for job '$JOB' — nothing was run." >&2
     agent-mcp check >&2
     exit 10
+  fi
+
+  # A checker that does not exist would be discovered after the money was spent, and would
+  # then have to either fail the run or be ignored — both wrong. Catch it here instead.
+  if [ -n "${JOB_VERIFY:-}" ]; then
+    # Split into an array rather than with `set --`: `verify:` may carry arguments, exactly as
+    # AGENT_RUN_ALERT_CMD does, and clobbering the positional parameters here would be a
+    # side effect waiting to surprise whatever reads them next.
+    read -r -a VERIFY_CMD <<< "$JOB_VERIFY"
+    command -v "${VERIFY_CMD[0]}" >/dev/null 2>&1 || {
+      echo "agent-run: job '$JOB' declares verify: ${VERIFY_CMD[0]}, which this deployment does not have." >&2
+      echo "  A vertical ships its checkers in bin/, alongside its jobs." >&2
+      exit 10
+    }
+  fi
+
+  # An input the job needs must already be there. This is what makes a propose -> commit chain
+  # safe: the commit job cannot run against a proposal that was never written, and finding that
+  # out costs nothing, because it happens before the model is called.
+  if [ "$PROBE" = 0 ] && [ -n "${JOB_REQUIRES:-}" ]; then
+    MISSING=()
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      [ -e "$(abspath "$p")" ] || MISSING+=("$p")
+    done <<< "$JOB_REQUIRES"
+    if [ ${#MISSING[@]} -gt 0 ]; then
+      echo "agent-run: job '$JOB' requires input that is not there — nothing was run." >&2
+      for p in "${MISSING[@]}"; do echo "  missing: $p" >&2; done
+      exit 10
+    fi
   fi
 fi
 
@@ -245,6 +291,9 @@ if [ "$DRY" = 1 ]; then
   echo "tools:    ${JOB_TOOLS:-<none>}"
   echo "mcp:      ${JOB_MCP:-<none>}${JOB_ALLOW:+   allow: $JOB_ALLOW}"
   echo "skills:   ${JOB_SKILLS:-<none>}"
+  echo "requires: $(printf '%s' "${JOB_REQUIRES:-}" | paste -sd' ' - | sed 's/^$/<nothing>/')"
+  echo "produces: $(printf '%s' "${JOB_PRODUCES:-}" | paste -sd' ' - | sed 's/^$/<unchecked>/')"
+  echo "verify:   ${JOB_VERIFY:-<none>}"
   echo "command:"
   printf '  pi'; for a in "${ARGS[@]}"; do printf ' %q' "$a"; done; printf ' <prompt>\n'
   exit 0
@@ -413,9 +462,48 @@ PY
 [ -n "${COST:-}" ] || COST=0
 [ -n "${TOKENS:-}" ] || TOKENS=0
 
-python3 - "$RUN_DIR/meta.json" "$JOB" "$RUN_ID" "$STAMP" "$START" "$END" "$STATUS" "$PI_RC" "$MCP_SERVERS" "$TOOL_LIST" "$COST" "$TOKENS" "$RUN_DIR/error.txt" <<'PY'
+# ---------------------------------------------------------------- the outcome contract
+# The model saying it is finished is not evidence that it is. If the job declared what its work
+# must leave behind, that is checked here, by something the model cannot talk out of it.
+#
+# Only when the run otherwise succeeded: 20, 21, 22 and 30 are more informative than 31, and
+# overwriting one of them would send a scheduler chasing the wrong fault.
+#
+# `produces` is checked for existence, content AND freshness. Freshness is the one that earns
+# its keep — an artefact left over from last week makes a run that did nothing look successful,
+# which is precisely the failure this exists to catch. A job whose output legitimately may not
+# change should express that as a `verify:` command instead.
+CONTRACT="none"
+if [ "$STATUS" = 0 ] && { [ -n "${JOB_PRODUCES:-}" ] || [ -n "${JOB_VERIFY:-}" ]; }; then
+  CONTRACT="ok"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    f="$(abspath "$p")"
+    if   [ ! -e "$f" ]; then CONTRACT="did not produce $p"
+    elif [ ! -s "$f" ]; then CONTRACT="produced $p, but it is empty"
+    elif [ "$(stat -c %Y "$f" 2>/dev/null || echo 0)" -lt "$START" ]; then
+      CONTRACT="did not write $p during this run — the file is older than the run"
+    else continue
+    fi
+    break
+  done <<< "${JOB_PRODUCES:-}"
+
+  if [ "$CONTRACT" = ok ] && [ -n "${JOB_VERIFY:-}" ]; then
+    read -r -a VERIFY_CMD <<< "$JOB_VERIFY"
+    if ! "${VERIFY_CMD[@]}" "$RUN_DIR" >"$RUN_DIR/verify.log" 2>&1; then
+      CONTRACT="verify failed: ${VERIFY_CMD[0]} (see verify.log)"
+    fi
+  fi
+
+  if [ "$CONTRACT" != ok ]; then
+    STATUS=31
+    printf '%s\n' "$CONTRACT" > "$RUN_DIR/error.txt"
+  fi
+fi
+
+python3 - "$RUN_DIR/meta.json" "$JOB" "$RUN_ID" "$STAMP" "$START" "$END" "$STATUS" "$PI_RC" "$MCP_SERVERS" "$TOOL_LIST" "$COST" "$TOKENS" "$RUN_DIR/error.txt" "$CONTRACT" <<'PY'
 import json, os, sys
-p, job, rid, stamp, start, end, status, rc, mcp, tools, cost, tokens, errf = sys.argv[1:14]
+p, job, rid, stamp, start, end, status, rc, mcp, tools, cost, tokens, errf, contract = sys.argv[1:15]
 err = ""
 if os.path.isfile(errf):
     err = open(errf, encoding='utf-8', errors='replace').read().strip()[:300]
@@ -426,6 +514,9 @@ json.dump({
     "cost_usd": float(cost), "tokens": int(tokens),
     "tools": [t for t in tools.split(',') if t],
     "mcp": mcp.split() if mcp else [],
+    # "none" when the job declared no contract — distinct from "ok", which means one was
+    # declared and held. A fleet audit wants to tell "checked and fine" from "never checked".
+    "contract": contract,
     "error": err,
 }, open(p, 'w'), indent=2)
 PY
@@ -442,6 +533,11 @@ cp "$RUN_DIR/meta.json" "$RUNS/$JOB/last.json" 2>/dev/null
 
 if [ "$STATUS" != 0 ]; then
   echo "agent-run: '$JOB' failed (exit $STATUS). Details: $RUN_DIR" >&2
+  if [ "$STATUS" = 31 ]; then
+    # The model finished and was pleased with itself. Say what it actually failed to do,
+    # because pi's stderr will contain nothing about it.
+    echo "  the job claimed to be done, but: $CONTRACT" >&2
+  fi
   sed -n '1,5p' "$RUN_DIR/stderr.log" >&2 2>/dev/null
   # The container has no way to send anything by design, so alerting is the host's job.
   [ -n "${AGENT_RUN_ALERT_CMD:-}" ] && $AGENT_RUN_ALERT_CMD "$RUN_DIR" >/dev/null 2>&1

@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+# fake-pi — a stand-in for the model runtime, so the harness can be tested without spending.
+#
+# Everything agent-run does AFTER the model returns — judging the outcome, checking the
+# contract, writing meta.json, choosing an exit code — is unreachable in CI otherwise, because
+# it needs a real run and a real credential. Those paths are the ones that decide whether a
+# client's deployment reports "done" or "the agent lied", so leaving them untested was the
+# gap worth closing.
+#
+# It emits the smallest event stream agent-run's parser recognises, verified against the real
+# schema: `agent_end` carrying assistant messages, each with content, stopReason and usage.
+#
+# Behaviour is driven entirely by the environment, so a test can ask for a specific outcome:
+#
+#   FAKE_PI_WRITE=path[:content]   create this file (relative to CWD, which agent-run sets to
+#                                  /data) before returning. Repeatable, comma-separated.
+#   FAKE_PI_SILENT=1               return with no assistant text at all -> agent-run sees 30
+#   FAKE_PI_ERROR=<message>        return an assistant message with stopReason=error
+#   FAKE_PI_EXIT=<n>               exit with this code (default 0 — the real pi exits 0 even
+#                                  when it never reached a model, which is why agent-run
+#                                  judges the stream rather than the exit code)
+#
+# This lives in ci/ and is never installed into the image. agent-run has no knowledge of it and
+# no test hook: the double is placed on PATH by the test, which is the only thing that makes it
+# a test double rather than a backdoor.
+import json, os, sys
+
+for spec in filter(None, os.environ.get("FAKE_PI_WRITE", "").split(",")):
+    path, _, content = spec.partition(":")
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+msg = {
+    "role": "assistant",
+    "stopReason": "end_turn",
+    "usage": {"cost": {"total": 0.0123}, "totalTokens": 456},
+    "content": [{"type": "text", "text": "done"}],
+}
+
+if os.environ.get("FAKE_PI_SILENT"):
+    msg["content"] = []
+if os.environ.get("FAKE_PI_ERROR"):
+    msg["stopReason"] = "error"
+    msg["errorMessage"] = os.environ["FAKE_PI_ERROR"]
+
+print(json.dumps({"type": "agent_end", "messages": [msg]}))
+sys.exit(int(os.environ.get("FAKE_PI_EXIT", "0")))

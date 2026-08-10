@@ -17,9 +17,15 @@ jobs:
       - name: Scripts parse
         run: |
           set -e
-          for f in bin/* ci/*.sh examples/*/bin/*; do
+          for f in bin/* ci/* examples/*/bin/*; do
+            [ -f "$f" ] || continue
             case "$f" in *.ts) continue;; esac
-            if head -1 "$f" | grep -q python; then python3 -m py_compile "$f"
+            # `compile()` rather than py_compile: py_compile writes a __pycache__ directory
+            # next to the source, which the same glob then picks up as a "script" on the next
+            # run. A syntax check that mutates the tree it is checking is one you cannot run
+            # twice, and it fails second in a way that looks like a real defect.
+            if head -1 "$f" | grep -q python; then
+              python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$f"
             else bash -n "$f"; fi
           done
           echo "all scripts parse"
@@ -98,6 +104,14 @@ jobs:
       # extension reports on session_start, before any model request.
       - name: Universality gate
         run: ci/universality-test.sh
+
+      # The other gate. Everything agent-run does after the model returns — judging the
+      # outcome, checking the contract, choosing an exit code — needs a real run to reach, so
+      # it runs against a test double placed on PATH. Those paths decide whether a client's
+      # deployment reports "done" or "the agent lied"; untested, they are the ones that turn
+      # out not to work.
+      - name: Outcome contracts
+        run: ci/contract-test.sh
 
   # The half that cannot be checked without a container — including the one property the whole
   # design rests on.

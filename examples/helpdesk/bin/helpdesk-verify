@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+# helpdesk-verify — the outcome contract for the `commit` job.
+#
+#   helpdesk-verify <run-dir>
+#
+# agent-run calls this after the model has said it is finished, with the run directory as its
+# only argument. Exit 0 means the work actually happened. Anything else fails the run with
+# exit 31, and the model's own account of events does not get a vote.
+#
+# This is the half of the propose -> commit pattern that the tool ceiling cannot provide.
+# `allow: helpdesk__add_note` guarantees the job could not have done anything WORSE than its
+# remit. It cannot guarantee the job did anything at all — an agent that reads the plan,
+# writes a confident summary and adds no notes exits 0 without this.
+#
+# Stdlib only, like the server it checks, so a fork needs no install step.
+import json, os, re, sys
+
+DATA  = os.environ.get("AGENT_DATA", "/data")
+PLAN  = os.path.join(DATA, "work/helpdesk/triage-plan.md")
+STORE = os.environ.get("HELPDESK_STORE", os.path.join(DATA, "work/helpdesk/tickets.json"))
+
+
+def fail(msg):
+    print(f"helpdesk-verify: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+try:
+    plan = open(PLAN, encoding="utf-8", errors="replace").read()
+except OSError:
+    fail(f"the plan is gone: {PLAN}")
+
+# Lines the commit job was supposed to act on, and the ones it was told to leave alone. Both
+# are checked: doing nothing is a failure, and so is acting on a ticket marked for a human.
+wanted, reserved = set(), set()
+for line in plan.splitlines():
+    m = re.search(r"ticket\s*#?(\d+)\s*:\s*(.+)", line, re.I)
+    if not m:
+        continue
+    (reserved if re.match(r"\s*needs a human", m.group(2), re.I) else wanted).add(int(m.group(1)))
+
+if not wanted and not reserved:
+    print("helpdesk-verify: the plan names no tickets — nothing to apply")
+    sys.exit(0)
+
+try:
+    tickets = {int(t["id"]): t for t in json.load(open(STORE, encoding="utf-8"))}
+except Exception as e:
+    fail(f"cannot read the ticket store {STORE}: {e}")
+
+missing = sorted(i for i in wanted if not (tickets.get(i, {}).get("notes")))
+if missing:
+    fail(f"planned but never noted: {', '.join(map(str, missing))}")
+
+# The stronger half. A job that decided on its own to handle a ticket the plan reserved for a
+# human has exceeded the plan, and that is worth failing over even though every note it added
+# was individually harmless.
+overreach = sorted(i for i in reserved if tickets.get(i, {}).get("notes"))
+if overreach:
+    fail(f"the plan reserved these for a human, and they were noted anyway: "
+         f"{', '.join(map(str, overreach))}")
+
+print(f"helpdesk-verify: {len(wanted)} ticket(s) noted, {len(reserved)} left for a human")
