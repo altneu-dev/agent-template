@@ -28,24 +28,37 @@ services:
     # and it is why a key set in a deployment UI can appear correct and still never arrive.
     # A name missing from this list is a value an operator can set and watch do nothing.
     #
+    # WRITTEN AS BARE `${VAR}`, NOT `${VAR:-}`. To Compose the two are identical: both become
+    # an empty string when nothing is set. To a deployment UI they are not. Coolify reads this
+    # file to decide which fields to offer, and renders a bare `${VAR}` as an editable empty
+    # field but a `${VAR:-}` as nothing at all — so with the empty default there was no field
+    # for ANTHROPIC_API_KEY anywhere in the UI, and the only clue was the container reporting
+    # itself unconfigured. `docker compose` warns "variable is not set, defaulting to a blank
+    # string" for each of these. That warning is the whole cost, and it buys an operator who
+    # can see what this deployment wants without reading a compose file.
+    #
+    # TZ and AGENT_NAME keep real defaults, which a UI shows prefilled and editable.
+    # SOURCE_COMMIT keeps an empty one on purpose: the platform supplies it, so a field an
+    # operator could type into would be an invitation to lie to the boot record.
+    #
     # Defaults are NOT repeated here. .env.example is the single source for them, and
     # agent-secret falls back to it; two places to change one default is how a committed
     # default silently stops applying. Empty is safe: agent-secret treats it as unset.
     environment:
       TZ: "${TZ:-Europe/Berlin}"
       AGENT_NAME: "${AGENT_NAME:-agent}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
-      AGENT_PROVIDER: "${AGENT_PROVIDER:-}"
-      AGENT_MODEL: "${AGENT_MODEL:-}"
-      AGENT_RUN_TIMEOUT: "${AGENT_RUN_TIMEOUT:-}"
-      AGENT_RUN_KEEP: "${AGENT_RUN_KEEP:-}"
-      AGENT_RUN_ALERT_CMD: "${AGENT_RUN_ALERT_CMD:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
+      AGENT_PROVIDER: "${AGENT_PROVIDER}"
+      AGENT_MODEL: "${AGENT_MODEL}"
+      AGENT_RUN_TIMEOUT: "${AGENT_RUN_TIMEOUT}"
+      AGENT_RUN_KEEP: "${AGENT_RUN_KEEP}"
+      AGENT_RUN_ALERT_CMD: "${AGENT_RUN_ALERT_CMD}"
       # A vertical's own variables, as NAME=value lines. This file is frozen against
       # verticals but a platform will not pass a variable this file does not name, so one
       # field carries them all. agent-secret parses it with the same grammar as /data/.env.
-      AGENT_ENV: "${AGENT_ENV:-}"
+      AGENT_ENV: "${AGENT_ENV}"
       # Recorded per boot when the platform provides it. A label; never load-bearing.
       SOURCE_COMMIT: "${SOURCE_COMMIT:-}"
 

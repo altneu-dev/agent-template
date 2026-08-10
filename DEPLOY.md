@@ -23,6 +23,23 @@ domain is configured — that is correct for a worker, not a problem to fix.
 Paste the names marked `<required>` in `.env.example`. Everything else has a working default
 and can be left alone.
 
+Three ways to get this wrong on Coolify. All three end identically — the deploy succeeds, the
+container reports **healthy**, and its log says `missing: ANTHROPIC_API_KEY` — so read the log
+rather than trusting the green dot:
+
+- **Preview Deployments is a separate scope.** Variables set there apply only to deployments
+  built from pull requests; a branch deployment never sees them. Set it under Production.
+- **Leave "Build Variable" off.** A build variable becomes a Docker build arg: absent from the
+  container's runtime environment, and baked into an image layer where it outlives every
+  rotation you will ever do.
+- **Saving is not applying.** Coolify holds variable edits until the next deployment. Press
+  Redeploy after saving.
+
+If a name has no field in the UI at all, switch the tab to **Developer view** — a plain
+`.env`-format editor — and paste `NAME=value`. Coolify derives its fields from `compose.yml`,
+so a name it did not parse has none until you add it. (This is also why `compose.yml` writes
+`${VAR}` rather than `${VAR:-}`; see the comment there before "tidying" it back.)
+
 A vertical's own variables go in the single `AGENT_ENV` field, as `NAME=value` lines:
 
 ```
@@ -53,8 +70,19 @@ actually do, rather than what the job file says it should.
 Then confirm the platform did not quietly drop a guardrail while rewriting the compose file:
 
 ```bash
-docker inspect <container> --format '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}}'
+C=<container>
+docker inspect $C --format '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}}'
 # want: 2147483648 512 true
+
+# Which variables actually arrived. Prints presence, never values.
+docker inspect $C --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | awk -F= '{print $1, (length($2)?"set":"EMPTY")}' | sort
+
+# And that the platform baked no credential into the image. Coolify injects every variable
+# as a build ARG, so this is a platform risk, not an image one — CI proves the image we
+# build is clean, and cannot see what a deploy adds.
+docker history --no-trunc $(docker inspect -f '{{.Image}}' $C) | grep -iE 'sk-ant-|sk-[A-Za-z0-9]{20}'
+# want: no output
 ```
 
 ## 4. Prove it keeps its memory — deploy twice
@@ -71,8 +99,13 @@ kb index
 agent-status --memory        # note the volume id, boots and builds
 ```
 
-Now push a trivial commit (or press Redeploy) and wait for healthy — allow 30–60 seconds for
-the healthcheck's start period. Then:
+Now **push a commit** and wait for healthy — allow 30–60 seconds for the healthcheck's start
+period.
+
+It has to be a real change. Pressing Redeploy on the same commit rebuilds byte-identical
+content, so the build id does not move and `--memory` correctly reports a *restart* with
+`image builds 1`. That is the mechanism working, not a fault: a restart is not the property
+under test. Then:
 
 ```bash
 agent-status --memory        # SAME volume id; boots >= 2; builds >= 2;
