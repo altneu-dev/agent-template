@@ -60,6 +60,18 @@ COPY knowledge/ /app/knowledge/
 COPY .env.example /app/.env.example
 RUN chmod +x /app/bin/*
 
+# A build identity, so a deployment can tell a restart from a redeploy.
+#
+# A content digest, deliberately not a timestamp: a `date` in a RUN is frozen by the layer
+# cache when nothing changed and thawed by an unrelated change, so it reports difference
+# exactly when there is none. A digest changes when — and only when — the thing a deploy
+# replaces changes. The pinned versions fold in, so bumping pi counts as a redeploy too.
+RUN set -e; \
+    { find /app -path /app/node_modules -prune -o -type f -print0 \
+        | LC_ALL=C sort -z | xargs -0 sha256sum; \
+      echo "pi=${PI_VERSION} mcporter=${MCPORTER_VERSION}"; } \
+    | sha256sum | cut -c1-12 > /app/.build-id
+
 # PATH twice over, because the two ways in resolve it differently. `ENV PATH` covers direct
 # exec (`docker compose exec agent agent-status`). A LOGIN shell — which is what you get from
 # `docker compose exec agent bash -l`, the natural way to look around inside a deployment —

@@ -54,6 +54,88 @@ for d in knowledge/notes logs/runs work .pi/agent; do
   fi
 done
 
+# --- persistence evidence -----------------------------------------------------------
+# A wiped /data and a healthy one look identical from inside: this script recreates the
+# layout happily either way, agent-status shows no runs, kb returns nothing. On a platform
+# that derives the volume name rather than taking the one we declare, that means memory can
+# be lost on every deploy while the deployment reports itself healthy.
+#
+# So the deployment records enough to answer the question itself. Three files, because the
+# oldest evidence is the most valuable and a single trimmed log destroys exactly that:
+#
+#   origin.json    written once, never rewritten — the volume's identity
+#   builds.jsonl   one line when the image changes — the redeploy ledger
+#   boots.jsonl    one line per container start   — trimmed, the cheapest signal
+#
+# Written here rather than in the entrypoint for the reason at the top of this file: a
+# platform supervisor may replace the start command, and evidence that only ran from an
+# entrypoint would be missing in precisely the deployment that needs it.
+record_evidence() {
+  local logs="$DATA/logs"
+  [ -d "$logs" ] || return 0
+
+  local now build commit boot_key
+  now=$(date -u '+%Y%m%dT%H%M%SZ')
+
+  # Absent when running from a checkout rather than a built image (the universality gate
+  # does this). Recorded as "unknown", and the verdict only counts transitions between two
+  # KNOWN build ids — so unknown never manufactures redeploy evidence.
+  build=$(cat "$APP/.build-id" 2>/dev/null) || build=""
+  [ -n "$build" ] || build="unknown"
+
+  # A label only. Platforms set it inconsistently, so nothing may depend on it.
+  commit=$(printf '%s' "${SOURCE_COMMIT:-}" | tr -cd 'a-zA-Z0-9._-' | cut -c1-40)
+
+  # One line per CONTAINER, not per call: this function also runs on every agent-run
+  # preflight, and an undeduplicated append would turn a busy day into a hundred fake boots
+  # and make the count meaningless. PID 1's start time on this host's boot is constant for
+  # the life of a container and different in the next one.
+  #
+  # Fields are counted after the last ')' because /proc/1/stat's comm field can itself
+  # contain spaces and parentheses. Hashed so the host's boot_id never sits in a file a
+  # client can read. The fallback over-counts boots, which is the safe direction: it can
+  # never invent redeploy evidence, only restart evidence.
+  boot_key=$( { cat /proc/sys/kernel/random/boot_id 2>/dev/null
+                sed 's/.*) //' /proc/1/stat 2>/dev/null | awk '{print $20}'; } \
+              | sha256sum 2>/dev/null | cut -c1-12 )
+  [ -n "$boot_key" ] || boot_key=$(cat /etc/hostname 2>/dev/null | sha256sum | cut -c1-12)
+
+  # Identity: written once and never again, so a changed volume_id is unambiguous proof of a
+  # different volume rather than of anything this script did.
+  if [ ! -f "$logs/origin.json" ]; then
+    printf '{"volume_id":"%s","first_seen_utc":"%s","first_build":"%s"}\n' \
+      "$(head -c 16 /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c1-12)" \
+      "$now" "$build" > "$logs/origin.json" 2>/dev/null
+  fi
+
+  # Lineage: one line when the image content changed. Never trimmed — this is the record
+  # that answers "did the last redeploy keep my memory", and it is a line per push at most.
+  local last_build=""
+  [ -f "$logs/builds.jsonl" ] && last_build=$(sed -n '$s/.*"build":"\([^"]*\)".*/\1/p' "$logs/builds.jsonl")
+  if [ "$build" != "$last_build" ]; then
+    printf '{"utc":"%s","build":"%s","commit":"%s"}\n' "$now" "$build" "$commit" \
+      >> "$logs/builds.jsonl" 2>/dev/null
+  fi
+
+  # Boots: skip if this container already recorded one. A single short append is atomic, so
+  # two containers starting together during a rolling deploy cannot interleave a torn line.
+  if ! grep -q "\"boot\":\"$boot_key\"" "$logs/boots.jsonl" 2>/dev/null; then
+    printf '{"boot_utc":"%s","boot":"%s","build":"%s","commit":"%s"}\n' \
+      "$now" "$boot_key" "$build" "$commit" >> "$logs/boots.jsonl" 2>/dev/null
+    # Bounded, and trimmed well above the point where the count still reads as evidence.
+    local n
+    n=$(wc -l < "$logs/boots.jsonl" 2>/dev/null || echo 0)
+    if [ "$n" -gt 2000 ] 2>/dev/null; then
+      tail -n 1000 "$logs/boots.jsonl" > "$logs/boots.jsonl.tmp" 2>/dev/null \
+        && mv "$logs/boots.jsonl.tmp" "$logs/boots.jsonl" 2>/dev/null
+    fi
+  fi
+}
+
+# --check is a readiness probe and the healthcheck's neighbour. A probe that mutates state is
+# one you cannot run twice, so it observes and never records.
+[ "$CHECK" = 0 ] && record_evidence
+
 # --- repo content: symlink, so a deploy updates it ----------------------------------
 # A real file that a fork later changes would go stale here forever, because seeding only
 # ever happens once. Pointing at /app means `git push` is the update mechanism.

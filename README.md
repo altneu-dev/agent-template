@@ -24,7 +24,16 @@ docker compose exec agent agent-run <job>        # do it
 docker compose exec agent agent-status           # what has it been doing?
 ```
 
-`git push` redeploys. Nothing a push does can lose the agent's memory.
+`git push` redeploys. Nothing a push does can lose the agent's memory — and the deployment
+can prove that itself, which matters because a platform that silently recreated the volume
+would look identical to a healthy one:
+
+```bash
+docker compose exec agent agent-status --memory
+```
+
+**[DEPLOY.md](DEPLOY.md)** is the runbook: Coolify steps, the variables, and the deploy-twice
+check that is the only real proof of persistence.
 
 ## The two halves
 
@@ -66,7 +75,8 @@ Files in the volume, read on demand. No daemon, no port, nothing published.
 
 ```bash
 agent-status                  # recent runs: when, how long, cost, outcome, why it failed
-agent-status --health         # exit 1 if the last run of any job failed (the HEALTHCHECK)
+agent-status --memory         # did /data survive the last redeploy? exit 1 if unproven
+agent-status --health         # exit 1 if a job is failing NOW (the HEALTHCHECK)
 agent-status --json           # for a host-side check
 ```
 

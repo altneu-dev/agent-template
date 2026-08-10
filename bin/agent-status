@@ -18,16 +18,25 @@ LOG="$DATA/logs/runs.jsonl"
 LIMIT="${AGENT_STATUS_LIMIT:-15}"
 
 MODE=table
+JSON=0
 JOB=""
+# --json is a modifier rather than a mode, so it composes with --memory. On its own it keeps
+# its old meaning: the run table, as JSON.
 while [ $# -gt 0 ]; do
   case "$1" in
     --health) MODE=health; shift ;;
-    --json)   MODE=json; shift ;;
+    --memory) MODE=memory; shift ;;
+    --json)   JSON=1; shift ;;
     -n)       LIMIT="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)        JOB="$1"; shift ;;
   esac
 done
+[ "$MODE" = table ] && [ "$JSON" = 1 ] && MODE=json
+
+# The boot this container recorded, used below to tell "failing now" from "failed once, long
+# ago". Empty when there is no evidence yet, and every use falls back to old behaviour.
+THIS_BOOT=$(sed -n '$s/.*"boot_utc":"\([^"]*\)".*/\1/p' "$DATA/logs/boots.jsonl" 2>/dev/null)
 
 # Health is judged from the last run of each job. A fresh deployment that has never run is
 # healthy — "not started yet" is not a fault, and reporting it as one would make every new
@@ -37,7 +46,27 @@ if [ "$MODE" = health ]; then
   rc=0
   for f in "$RUNS"/*/last.json; do
     [ -e "$f" ] || continue
-    e=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('exit',0))" "$f" 2>/dev/null || echo 0)
+    # Only failures from THIS boot count. last.json lives in the volume, so without this a
+    # job that failed yesterday makes every new container report unhealthy the moment it
+    # starts — including the container carrying the fix. Platforms gate deployments on
+    # health, so that turns one bad run into an un-deployable service.
+    #
+    # Both stamps use the same compact UTC format, so a string compare is a time compare.
+    # History stays visible in `agent-status`; this only decides "is it failing now".
+    e=$(python3 - "$f" "${THIS_BOOT:-}" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); raise SystemExit
+boot = sys.argv[2]
+started = str(d.get('started_utc', ''))
+if boot and started and started < boot:
+    print(0)            # a failure from before this container existed
+else:
+    print(d.get('exit', 0))
+PY
+) || e=0
     if [ "$e" != 0 ]; then
       echo "unhealthy: $(basename "$(dirname "$f")") last exited $e"
       rc=1
@@ -45,6 +74,112 @@ if [ "$MODE" = health ]; then
   done
   [ "$rc" = 0 ] && echo "ok"
   exit $rc
+fi
+
+# --- memory: did this deployment keep what it learned? ------------------------------
+if [ "$MODE" = memory ]; then
+  python3 - "$DATA" "$JSON" <<'PY'
+import json, os, sys, glob
+data, want_json = sys.argv[1], sys.argv[2] == "1"
+logs = os.path.join(data, "logs")
+
+def lines(name):
+    out = []
+    try:
+        for ln in open(os.path.join(logs, name), encoding='utf-8', errors='replace'):
+            ln = ln.strip()
+            if ln:
+                try: out.append(json.loads(ln))
+                except json.JSONDecodeError: pass
+    except OSError:
+        pass
+    return out
+
+origin = {}
+try:
+    origin = json.load(open(os.path.join(logs, "origin.json")))
+except Exception:
+    pass
+boots, builds = lines("boots.jsonl"), lines("builds.jsonl")
+
+# Only transitions between two KNOWN build ids are evidence. A checkout has no .build-id and
+# records "unknown"; counting that as a build would let a deployment claim it survived a
+# redeploy that never happened.
+known = [b.get("build") for b in builds if b.get("build") and b.get("build") != "unknown"]
+distinct = sorted(set(known), key=known.index)
+
+survived_restart  = len(boots) >= 2
+survived_redeploy = len(distinct) >= 2
+
+# Corroboration from real memory rather than from the evidence files, so the two can be
+# compared: a deployment whose logs survived but whose knowledge base did not is a different
+# fault, and the operator should be able to see it.
+runs = 0
+try:
+    runs = sum(1 for ln in open(os.path.join(data, "logs", "runs.jsonl"),
+                                encoding='utf-8', errors='replace') if ln.strip())
+except OSError:
+    pass
+notes = len(glob.glob(os.path.join(data, "knowledge", "notes", "*.md")))
+
+state = ("damaged" if boots and not origin
+         else "proven" if (survived_restart or survived_redeploy)
+         else "unproven")
+code = {"proven": 0, "unproven": 1, "damaged": 2}[state]
+
+if want_json:
+    json.dump({
+        "volume_id": origin.get("volume_id"),
+        "first_seen_utc": origin.get("first_seen_utc"),
+        "boots": len(boots),
+        "builds": len(distinct),
+        "current_build": (boots[-1].get("build") if boots else None),
+        "survived_restart": survived_restart,
+        "survived_redeploy": survived_redeploy,
+        "runs": runs, "notes": notes,
+        "state": state,
+    }, sys.stdout, indent=2)
+    print()
+    raise SystemExit(code)
+
+print("memory (%s)" % data)
+print(f"  volume id      {origin.get('volume_id', '-')}     <- record this; it must not change")
+print(f"  first seen     {origin.get('first_seen_utc', '-')}")
+print(f"  boots          {len(boots)}" + (f"   (this one {boots[-1].get('boot_utc')})" if boots else ""))
+print(f"  image builds   {len(distinct)}" + (f"   (now {distinct[-1]})" if distinct else ""))
+print(f"  corroboration  {runs} run(s) recorded, {notes} knowledge note(s)")
+print()
+
+# The verdict always names WHICH survival is proven. "12 boots, persisting" is a lie by
+# omission when all twelve share one image: restarts are not redeploys, and surviving a
+# redeploy is the promise being made.
+if state == "damaged":
+    print("VERDICT: /data is DAMAGED — boots are recorded but the volume's identity file is")
+    print("         gone. Something removed part of the volume. Treat memory as unreliable")
+    print("         and restore from backup.")
+elif survived_redeploy:
+    print(f"VERDICT: /data is persisting. It has outlived {len(boots) - 1} restart(s) and")
+    print(f"         {len(distinct) - 1} redeploy(s) — the last redeploy did not lose memory.")
+elif survived_restart:
+    print(f"VERDICT: /data outlived {len(boots) - 1} container restart(s), but this deployment")
+    print("         has only ever run one image build. Surviving a restart is NOT proof of")
+    print("         surviving a redeploy. Push a change and run this again.")
+else:
+    print("VERDICT: only this boot is recorded. That is normal for a first deploy and is NOT")
+    print("         proof of anything else. If this deployment has been deployed before, its")
+    print("         memory was not kept. Deploy once more and run this again — two boots under")
+    print("         the same volume id is the proof. See DEPLOY.md.")
+raise SystemExit(code)
+PY
+  exit $?
+fi
+
+# One line, only when the evidence is thin. Someone reading this daily should see nothing;
+# someone whose deployment is quietly losing its memory should not be able to miss it.
+# A wc -l rather than a second python start, since this runs on every invocation.
+if [ "$MODE" = table ] && [ "$(wc -l < "$DATA/logs/boots.jsonl" 2>/dev/null || echo 0)" -le 1 ]; then
+  echo "! only one boot recorded — persistence unproven. Run: agent-status --memory"
+  echo
 fi
 
 [ -f "$LOG" ] || { echo "no runs recorded yet."; echo "  Run one with: agent-run <job>   ('agent-run --list' shows them)"; exit 0; }
