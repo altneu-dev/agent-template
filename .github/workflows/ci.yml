@@ -150,14 +150,27 @@ jobs:
           run agent-init --check
           run agent-run --list
 
-          # The bare template is a framework, not a deployment. It must SAY so rather than
-          # idling healthy and silent, which is the way a half-finished fork fails at a client.
+          # An unfinished deployment must SAY so rather than idling healthy and silent, which
+          # is how a half-finished fork fails at a client. No credentials exist in CI, so this
+          # always has at least one thing to report.
           if run agent-status --ready; then
-            echo "expected the unconfigured template to report itself not ready"; exit 1
+            echo "expected an unconfigured deployment to report itself not ready"; exit 1
           fi
-          out=$(run agent-status --ready || true)
-          echo "$out" | grep -q "no jobs"    || { echo "--ready did not name the missing jobs"; exit 1; }
-          echo "$out" | grep -q "no context" || { echo "--ready did not name the missing context"; exit 1; }
+          ready=$(run agent-status --ready || true)
+          [ -n "$ready" ] || { echo "--ready failed without saying why"; exit 1; }
+
+          # What it must name depends on what THIS image actually contains. Asserting the bare
+          # template's wording would fail on every fork branch — and a fork is what a client
+          # deployment is, so the test would be red for everyone it is supposed to protect.
+          if [ -n "$(run agent-run --list | grep 'no jobs defined')" ]; then
+            echo "$ready" | grep -q "no jobs"    || { echo "--ready did not name the missing jobs"; exit 1; }
+            echo "$ready" | grep -q "no context" || { echo "--ready did not name the missing context"; exit 1; }
+            echo "readiness: the bare framework names its missing jobs and context"
+          else
+            echo "$ready" | grep -q "not configured" \
+              || { echo "--ready did not name the missing credentials"; exit 1; }
+            echo "readiness: this fork is filled in, and names its missing credentials"
+          fi
           echo "$(run agent-mcp check)"  | grep -q "no MCP servers configured"
           echo "$(run kb schema)"        | grep -q "SQLite FTS5"
 
