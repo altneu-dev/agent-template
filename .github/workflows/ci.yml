@@ -67,11 +67,6 @@ jobs:
           assert len(data) == 1, f"/data must be mounted exactly once: {data}"
           assert data[0]['type'] == 'volume', "/data must be a named volume, not a bind"
 
-          # Platforms that derive the real volume name ignore `name:` and `external:`
-          # (Coolify #3954), so declaring either reads as a guarantee that is not there.
-          vol = c.get('volumes', {}).get('agent-data') or {}
-          assert not vol.get('name') and not vol.get('external'), \
-              "never pin the volume name — the platform derives it and ignores this"
 
           # A variable the compose file does not name never reaches the container. This
           # catches the reverse mistake: naming one that nothing documents.
@@ -85,6 +80,17 @@ jobs:
           undocumented = named - documented - {'SOURCE_COMMIT', 'AGENT_ENV'}
           assert not undocumented, f"named in compose but absent from .env.example: {undocumented}"
           print("compose shape ok")
+          EOF
+
+          # The volume declaration is checked against the SOURCE file, not the rendered model:
+          # `docker compose config` normalises and always emits a project-prefixed `name:`, so
+          # the rendered form can never satisfy this. What matters is what we declare.
+          python3 - <<'EOF'
+          import yaml
+          vol = (yaml.safe_load(open('compose.yml')).get('volumes') or {}).get('agent-data') or {}
+          assert not vol.get('name') and not vol.get('external'), \
+              "never pin the volume name — the platform derives it and ignores this (Coolify #3954)"
+          print("volume declaration ok")
           EOF
 
       # The gate. Installs each example vertical and fails if a framework file moved, then
@@ -189,20 +195,28 @@ jobs:
           ORIGIN=$(on $v1 cat /data/logs/origin.json)
           ID1=$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["volume_id"])' "$ORIGIN")
 
-          echo "== repeated agent-init inside one container is still one boot =="
-          on $v1 sh -lc 'agent-init >/dev/null && agent-init >/dev/null && agent-init >/dev/null'
-          on $v1 agent-status --memory --json > /tmp/b.json || true
-          python3 -c '
-          import json; d=json.load(open("/tmp/b.json"))
-          assert d["boots"]==2, f"expected 2 boots (this container + the previous), got {d}"
-          print("  dedup holds:", d["boots"], "boots after 4 inits across 2 containers")'
+          echo "== repeated agent-init inside ONE container adds no boots =="
+          # Measured as a delta within a single container: every `docker run` is a new
+          # container and so is a legitimate new boot. What must not happen is agent-run's
+          # preflight inflating the count on each call.
+          delta=$(on $v1 sh -lc '
+            a=$(wc -l < /data/logs/boots.jsonl)
+            agent-init >/dev/null; agent-init >/dev/null; agent-init >/dev/null
+            b=$(wc -l < /data/logs/boots.jsonl); echo $((b-a))')
+          [ "$delta" = 0 ] || { echo "three extra inits added $delta boot line(s)"; exit 1; }
+          echo "  dedup holds: 3 further inits added 0 boots"
 
-          echo "== same volume, new container: restart proven, redeploy not =="
-          python3 -c '
-          import json; d=json.load(open("/tmp/b.json"))
+          echo "== same volume, another container: restart proven, redeploy not =="
+          on $v1 agent-status --memory --json > /tmp/b.json || true
+          python3 - "$ID1" <<'EOF'
+          import json, sys
+          d = json.load(open("/tmp/b.json"))
+          assert d["volume_id"] == sys.argv[1], f'volume identity changed: {d}'
+          assert d["boots"] >= 2, d
           assert d["survived_restart"] is True, d
           assert d["survived_redeploy"] is False, "same image is not a redeploy"
-          print("  restart proven, redeploy correctly still unproven")'
+          print("  restart proven over", d["boots"], "boots; redeploy correctly still unproven")
+          EOF
 
           echo "== a different volume is a different identity =="
           on $v2 agent-status --memory --json > /tmp/c.json || true
