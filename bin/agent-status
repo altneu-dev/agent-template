@@ -112,6 +112,12 @@ boots, builds = lines("boots.jsonl"), lines("builds.jsonl")
 known = [b.get("build") for b in builds if b.get("build") and b.get("build") != "unknown"]
 distinct = sorted(set(known), key=known.index)
 
+# The commit that produced the running image, recorded by agent-init from SOURCE_COMMIT when
+# the platform sets it. The build id is a content digest and answers "did this change"; only
+# the commit answers "which change", which is what makes a fleet across many client servers
+# debuggable. A label, never load-bearing: platforms set it inconsistently and it may be empty.
+commit = next((b.get("commit") for b in reversed(builds) if b.get("commit")), "")
+
 survived_restart  = len(boots) >= 2
 survived_redeploy = len(distinct) >= 2
 
@@ -138,6 +144,7 @@ if want_json:
         "boots": len(boots),
         "builds": len(distinct),
         "current_build": (boots[-1].get("build") if boots else None),
+        "source_commit": commit or None,
         "survived_restart": survived_restart,
         "survived_redeploy": survived_redeploy,
         "runs": runs, "notes": notes,
@@ -151,6 +158,8 @@ print(f"  volume id      {origin.get('volume_id', '-')}     <- record this; it m
 print(f"  first seen     {origin.get('first_seen_utc', '-')}")
 print(f"  boots          {len(boots)}" + (f"   (this one {boots[-1].get('boot_utc')})" if boots else ""))
 print(f"  image builds   {len(distinct)}" + (f"   (now {distinct[-1]})" if distinct else ""))
+if commit:
+    print(f"  from commit    {commit[:12]}")
 print(f"  corroboration  {runs} run(s) recorded, {notes} knowledge note(s)")
 print()
 
