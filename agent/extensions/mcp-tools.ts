@@ -21,6 +21,8 @@
  * visible and safe, rather than an unintended capability.
  */
 import { createRuntime, type Runtime, type ServerToolInfo } from "mcporter";
+import { appendFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 
 const CONFIG = process.env.AGENT_MCP_CONFIG ?? "";
 const SERVERS = (process.env.AGENT_MCP_SERVERS ?? "").split(/\s+/).filter(Boolean);
@@ -28,6 +30,58 @@ const ALLOW = new Set(
   (process.env.AGENT_MCP_ALLOW ?? "").split(",").map((s) => s.trim()).filter(Boolean),
 );
 const CALL_TIMEOUT_MS = Number(process.env.AGENT_MCP_CALL_TIMEOUT_MS ?? 120_000);
+
+/* ---------------------------------------------------------------- the action ledger
+ *
+ * Every external effect this deployment has goes through callTool below. That is not a
+ * convention: built-in tools cannot leave the container, so an MCP call is the only way for
+ * anything to reach a client's systems. The ledger is therefore complete by construction
+ * rather than by diligence — there is no code path that could change something without
+ * passing through here.
+ *
+ * `agent-status` shows runs. After an incident the question is not "what ran" but "what did
+ * it change", and runs.jsonl cannot answer that.
+ *
+ * TWO LINES PER CALL, on purpose. The `start` line is written BEFORE the call and, if it
+ * cannot be written, the call is refused — an effect that cannot be recorded must not happen,
+ * and at that moment it still hasn't. The `end` line records the outcome. A `start` with no
+ * `end` is the case worth being able to see: something was sent to a client's system and we
+ * do not know whether it landed.
+ *
+ * Argument VALUES are not recorded. They are the payload that reaches the client's systems and
+ * routinely carry personal data; a log at 0600 in a volume that gets backed up is the wrong
+ * home for it. Keys and a digest of the values are enough to answer "was this the same call
+ * twice" and "which record did it touch", which is what an audit actually asks.
+ * AGENT_EFFECTS_VERBOSE=1 opts into full arguments while building a vertical.
+ */
+const EFFECTS = process.env.AGENT_EFFECTS_LOG ?? "";
+const EFFECTS_VERBOSE = process.env.AGENT_EFFECTS_VERBOSE === "1";
+const RUN_ID = process.env.AGENT_RUN_ID ?? "";
+const JOB = process.env.AGENT_JOB ?? "";
+
+function digestOf(args: Record<string, unknown>): string {
+  try {
+    return createHash("sha256").update(JSON.stringify(args)).digest("hex").slice(0, 12);
+  } catch {
+    return "undigestible";
+  }
+}
+
+/** Returns false when the line could not be written. Never throws: the caller decides what a
+ *  failed write means, and that differs between the two phases. */
+function record(entry: Record<string, unknown>): boolean {
+  if (!EFFECTS) return true;            // no ledger configured (a probe, or a bare pi run)
+  // The compact stamp the rest of the volume uses (boots.jsonl, runs.jsonl), so the two can be
+  // read side by side and compared as strings.
+  const utc = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  try {
+    appendFileSync(EFFECTS, JSON.stringify({ utc, ...entry }) + "\n", { mode: 0o600 });
+    return true;
+  } catch (err: any) {
+    console.error(`mcp-tools: cannot write the action ledger: ${err?.message ?? err}`);
+    return false;
+  }
+}
 
 /** MCP servers describe parameters as JSON Schema; pi wants a schema object too. Passing it
  *  through unchanged keeps the server's own contract intact — rewriting it would silently
@@ -90,12 +144,43 @@ export default async function (pi: any) {
         parameters: schemaOf(tool),
         async execute(_id: string, params: Record<string, unknown>, signal?: AbortSignal) {
           if (signal?.aborted) throw new Error("cancelled");
-          const result = await runtime.callTool(server, tool.name, {
-            args: params ?? {},
-            timeoutMs: CALL_TIMEOUT_MS,
-            disableOAuth: true,
+          const args = params ?? {};
+          const call = randomUUID().slice(0, 12);
+
+          const opened = record({
+            phase: "start", call, run: RUN_ID, job: JOB, server, tool: tool.name,
+            arg_keys: Object.keys(args).sort(),
+            args_digest: digestOf(args),
+            ...(EFFECTS_VERBOSE ? { args } : {}),
           });
-          return { content: toContent(result) };
+          if (!opened) {
+            // Refused, not degraded. The effect has not happened yet, and an effect nobody can
+            // account for afterwards is worse than a failed tool call the model can react to.
+            throw new Error(
+              `refusing to call ${server}__${tool.name}: the action ledger is not writable, ` +
+              `so this change could not be accounted for afterwards`,
+            );
+          }
+
+          const started = Date.now();
+          try {
+            const result = await runtime.callTool(server, tool.name, {
+              args,
+              timeoutMs: CALL_TIMEOUT_MS,
+              disableOAuth: true,
+            });
+            record({ phase: "end", call, outcome: "ok", ms: Date.now() - started });
+            return { content: toContent(result) };
+          } catch (err: any) {
+            // A failed call still changed something often enough to matter — a timeout says
+            // nothing about whether the far side committed. Recorded, then re-thrown unchanged
+            // so the model sees exactly what it would have seen.
+            record({
+              phase: "end", call, outcome: "error", ms: Date.now() - started,
+              error: String(err?.message ?? err).slice(0, 300),
+            });
+            throw err;
+          }
         },
       });
       registered++;

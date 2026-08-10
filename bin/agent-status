@@ -3,6 +3,7 @@
 #
 #   agent-status              the last runs: when, how long, outcome, cost of failure
 #   agent-status <job>        the same, for one job, plus the last failure's reason
+#   agent-status --effects    what this deployment changed OUTSIDE the container
 #   agent-status --health     exit 1 if the most recent run of any job failed (HEALTHCHECK)
 #   agent-status --json       machine-readable, for a host-side check
 #
@@ -24,11 +25,12 @@ JOB=""
 # its old meaning: the run table, as JSON.
 while [ $# -gt 0 ]; do
   case "$1" in
-    --health) MODE=health; shift ;;
-    --memory) MODE=memory; shift ;;
+    --health)  MODE=health; shift ;;
+    --memory)  MODE=memory; shift ;;
+    --effects) MODE=effects; shift ;;
     --json)   JSON=1; shift ;;
     -n)       LIMIT="${2:?}"; shift 2 ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)        JOB="$1"; shift ;;
   esac
 done
@@ -174,6 +176,89 @@ PY
   exit $?
 fi
 
+# --- effects: what did this deployment change outside itself? -----------------------
+# runs.jsonl answers "what ran". After an incident nobody asks that; they ask what was
+# touched. Built-in tools cannot leave the container, so every external effect is an MCP call
+# and the ledger is complete by construction — see agent/extensions/mcp-tools.ts.
+if [ "$MODE" = effects ]; then
+  python3 - "$DATA/logs/effects.jsonl" "$LIMIT" "$JOB" "$JSON" <<'PY'
+import json, os, sys
+path, limit, job, want_json = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
+
+events = []
+try:
+    for ln in open(path, encoding='utf-8', errors='replace'):
+        ln = ln.strip()
+        if ln:
+            try: events.append(json.loads(ln))
+            except json.JSONDecodeError: pass
+except OSError:
+    if want_json:
+        print("[]"); raise SystemExit(0)
+    print("no external effects recorded.")
+    print("  Either nothing has reached outside the container, or no job here declares mcp.")
+    raise SystemExit(0)
+
+# Pair the two phases by call id. An unpaired `start` is the one that matters: something was
+# sent to a client's system and no completion was ever recorded, so whether it landed is
+# unknown. That is a different fact from "it failed", and it must not be rendered as one.
+calls, order = {}, []
+for e in events:
+    cid = e.get("call")
+    if not cid:
+        continue
+    if cid not in calls:
+        calls[cid] = {}
+        order.append(cid)
+    calls[cid].update(e if e.get("phase") == "start" else
+                      {k: v for k, v in e.items() if k not in ("utc", "phase")})
+    if e.get("phase") == "end":
+        calls[cid]["outcome"] = e.get("outcome", "ok")
+
+rows = [calls[c] for c in order]
+if job:
+    rows = [r for r in rows if r.get("job") == job]
+rows = rows[-limit:]
+
+if want_json:
+    json.dump(rows, sys.stdout, indent=2); print(); raise SystemExit(0)
+
+if not rows:
+    print(f"no external effects recorded{' for ' + job if job else ''}.")
+    raise SystemExit(0)
+
+print(f"{'when (UTC)':<18} {'job':<14} {'tool':<30} {'outcome':<10} {'ms':>6}")
+print("-" * 84)
+unknown = failed = 0
+for r in rows:
+    outcome = r.get("outcome")
+    if outcome is None:
+        shown, unknown = "UNFINISHED", unknown + 1
+    elif outcome != "ok":
+        shown, failed = "ERROR", failed + 1
+    else:
+        shown = "ok"
+    tool = f"{r.get('server','?')}__{r.get('tool','?')}"
+    print(f"{r.get('utc',''):<18} {r.get('job',''):<14} {tool:<30} {shown:<10} "
+          f"{str(r.get('ms','-')):>6}")
+    if r.get("error"):
+        print(f"{'':18} {'':14} -> {str(r['error'])[:56]}")
+
+print()
+print(f"{len(rows)} call(s), {failed} failed, {unknown} with no recorded outcome")
+if unknown:
+    print()
+    print("UNFINISHED means the call was sent and no completion was ever recorded — the run")
+    print("was killed mid-call, or the process died. Whether the far side applied it is not")
+    print("knowable from here. Check the target system before re-running the job.")
+
+# Argument values are deliberately absent: they are the payload that reached the client's
+# systems. Keys and a digest are recorded instead. AGENT_EFFECTS_VERBOSE=1 changes that while
+# building a vertical, and should not be left on.
+PY
+  exit $?
+fi
+
 # One line, only when the evidence is thin. Someone reading this daily should see nothing;
 # someone whose deployment is quietly losing its memory should not be able to miss it.
 # A wc -l rather than a second python start, since this runs on every invocation.
@@ -196,6 +281,7 @@ MEANING = {
     21: "provider busy",
     22: "timed out",
     30: "no result",
+    31: "contract not met",
     40: "internal error",
 }
 

@@ -113,6 +113,12 @@ jobs:
       - name: Outcome contracts
         run: ci/contract-test.sh
 
+      # The action ledger answers "what did the agent change in our systems". Two properties
+      # have to hold or it is worse than nothing, because it would look complete while missing
+      # things: every call leaves a record, and a call that cannot be recorded does not happen.
+      - name: The action ledger
+        run: ci/effects-test.sh
+
   # The half that cannot be checked without a container — including the one property the whole
   # design rests on.
   container:

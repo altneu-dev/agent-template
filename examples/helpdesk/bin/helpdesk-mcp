@@ -16,8 +16,18 @@ def load():
     except Exception:
         return [{"id": 1, "subject": "Printer offline", "status": "open", "notes": []}]
 
+def save(tickets):
+    os.makedirs(os.path.dirname(STORE) or ".", exist_ok=True)
+    with open(STORE, "w", encoding="utf-8") as fh:
+        json.dump(tickets, fh, indent=2)
+
 def reply(i, result):
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": i, "result": result}) + "\n"); sys.stdout.flush()
+
+def error(i, message):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": i,
+                                 "error": {"code": -32000, "message": message}}) + "\n")
+    sys.stdout.flush()
 
 TOOLS = [
     {"name": "list_open", "description": "List open tickets.",
@@ -46,11 +56,28 @@ for line in sys.stdin:
         reply(mid, {"tools": TOOLS})
     elif method == "tools/call":
         p = m.get("params") or {}
-        if p.get("name") == "list_open":
+        name = p.get("name")
+        args = p.get("arguments") or p.get("args") or {}
+        if name == "list_open":
             open_ = [t for t in load() if t.get("status") == "open"]
             reply(mid, {"content": [{"type": "text", "text": json.dumps(open_)}]})
+        elif name == "add_note":
+            # Actually appends. A stub that replied "noted" without writing anything would make
+            # every check downstream — a verify: command, an audit, a human looking at the
+            # store — pass against work that never happened, which is the exact failure this
+            # example exists to demonstrate being caught.
+            tickets = load()
+            tid = args.get("id")
+            for t in tickets:
+                if t.get("id") == tid:
+                    t.setdefault("notes", []).append(str(args.get("note", "")))
+                    save(tickets)
+                    reply(mid, {"content": [{"type": "text", "text": f"noted on ticket {tid}"}]})
+                    break
+            else:
+                error(mid, f"no such ticket: {tid!r}")
         else:
-            reply(mid, {"content": [{"type": "text", "text": "noted"}]})
+            error(mid, f"no such tool: {name!r}")
     else:
         sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid,
                                      "error": {"code": -32601, "message": "no such method"}}) + "\n")

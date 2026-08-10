@@ -334,6 +334,14 @@ if [ -n "${JOB_MCP:-}" ]; then
   export AGENT_MCP_SERVERS="$JOB_MCP"
   export AGENT_MCP_ALLOW="$MCP_TOOL_LIST"
   MCP_SERVERS="$JOB_MCP"
+
+  # The action ledger: every call that reaches outside the container. The extension is told
+  # where to write rather than deriving it — a path it guessed would be one more thing to get
+  # wrong on a fork with a different layout, and it would fail silently by writing somewhere
+  # nobody looks. Not set for --probe-tools, which never calls a tool.
+  export AGENT_EFFECTS_LOG="$DATA/logs/effects.jsonl"
+  export AGENT_RUN_ID="$RUN_ID"
+  export AGENT_JOB="$JOB"
 fi
 
 START=$(date -u +%s)
