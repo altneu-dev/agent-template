@@ -4,6 +4,7 @@
 #   agent-status              the last runs: when, how long, outcome, cost of failure
 #   agent-status <job>        the same, for one job, plus the last failure's reason
 #   agent-status --effects    what this deployment changed OUTSIDE the container
+#   agent-status --ready      exit 1 if this fork is not finished (no jobs, no context, ...)
 #   agent-status --health     exit 1 if the most recent run of any job failed (HEALTHCHECK)
 #   agent-status --json       machine-readable, for a host-side check
 #
@@ -28,6 +29,7 @@ while [ $# -gt 0 ]; do
     --health)  MODE=health; shift ;;
     --memory)  MODE=memory; shift ;;
     --effects) MODE=effects; shift ;;
+    --ready)   MODE=ready; shift ;;
     --json)   JSON=1; shift ;;
     -n)       LIMIT="${2:?}"; shift 2 ;;
     -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -176,6 +178,62 @@ PY
   exit $?
 fi
 
+# --- ready: is this fork actually finished? ------------------------------------------
+# A half-filled fork deploys, reports healthy, and idles politely forever doing nothing. That
+# is the worst way for it to fail, because everything looks fine — so this says out loud what
+# is missing, and the idle banner prints it where a platform's log tab shows it.
+#
+# Deliberately NOT part of --health. Health is the HEALTHCHECK, and a deployment nobody has
+# configured yet is not sick; making it unhealthy would block the very deploy that carries the
+# configuration.
+if [ "$MODE" = ready ]; then
+  problems=0
+  note() { echo "$@"; problems=$((problems + 1)); }
+
+  jobs=0
+  for f in "$DATA/jobs"/*.md; do
+    [ -e "$f" ] || continue
+    [ "$(basename "$f")" = README.md ] && continue
+    jobs=$((jobs + 1))
+  done
+  [ "$jobs" = 0 ] && note "no jobs: this agent has nothing it can be asked to do.
+  Add one to agent/jobs/ — see its README."
+
+  # A fork that never replaced context/ has not been told who it works for. The marker is in
+  # the template's own README, so any real file — added or written over it — counts.
+  ctx=0
+  for f in "$DATA/context"/*; do
+    [ -f "$f" ] || continue
+    grep -q 'agent-template:placeholder' "$f" 2>/dev/null && continue
+    ctx=$((ctx + 1))
+  done
+  [ "$ctx" = 0 ] && note "no context: agent/context/ is still the template's placeholder.
+  The agent does not know who it works for, what is in scope, or what it must never touch."
+
+  agent-secret check -q 2>/dev/null || note "not configured: $(agent-secret check 2>&1 | head -3 | tr '\n' ' ')"
+
+  if [ -n "$(find "${AGENT_APP:-/app}/agent/mcp" -name '*.json' 2>/dev/null)" ]; then
+    agent-mcp check >/dev/null 2>&1 || note "MCP definitions do not resolve: run agent-mcp check"
+  fi
+
+  # Building each job's command catches what static checks cannot: a job naming a skill that
+  # was never shipped, a prompt that is missing, front matter that does not parse. It costs
+  # nothing — --dry-run touches nothing and calls no model.
+  for f in "$DATA/jobs"/*.md; do
+    [ -e "$f" ] || continue
+    j="$(basename "$f" .md)"; [ "$j" = README ] && continue
+    agent-run "$j" --dry-run >/dev/null 2>&1 || note "job '$j' does not build: run agent-run $j --dry-run"
+  done
+
+  if [ "$problems" = 0 ]; then
+    echo "ready: $jobs job(s), context configured, credentials present"
+    exit 0
+  fi
+  echo
+  echo "$problems thing(s) to finish before this deployment can do anything."
+  exit 1
+fi
+
 # --- effects: what did this deployment change outside itself? -----------------------
 # runs.jsonl answers "what ran". After an incident nobody asks that; they ask what was
 # touched. Built-in tools cannot leave the container, so every external effect is an MCP call
@@ -282,6 +340,7 @@ MEANING = {
     22: "timed out",
     30: "no result",
     31: "contract not met",
+    32: "escalated",
     40: "internal error",
 }
 

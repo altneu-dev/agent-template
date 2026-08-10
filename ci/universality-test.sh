@@ -80,6 +80,13 @@ for example in "$REPO"/examples/*/; do
   agent-secret check -q && ok "deployment reports itself configured" \
                         || no "agent-secret check failed"
 
+  # An example is a worked fork, so it must satisfy the same readiness gate a client deployment
+  # does — jobs present, context written, every job actually buildable. If an example cannot
+  # pass this, the gate is asking forks for something the framework's own examples do not do.
+  agent-status --ready >/dev/null 2>&1 && ok "the fork is complete (agent-status --ready)" \
+                                       || { no "agent-status --ready fails for this example"
+                                            agent-status --ready 2>&1 | sed 's/^/        /'; }
+
   # AGENTS.md instructs the agent to use kb. A documented command that does not exist is the
   # exact failure this repo was written to stop repeating, so it is asserted rather than assumed.
   if kb add "gate probe" </dev/null >/dev/null 2>&1 && kb index >/dev/null 2>&1 \

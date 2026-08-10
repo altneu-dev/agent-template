@@ -133,5 +133,69 @@ job silent 'description: says nothing at all' 'tools: read' 'produces: work/neve
 run 30 "no result at all stays 30, the contract does not overwrite it" silent FAKE_PI_SILENT=1
 
 echo
+echo "== stopping to ask is not the same as failing =="
+# Before this, "escalated" and "silently did nothing" produced identical runs: exit 0, no
+# artefacts, a polite summary. The behaviour you most want to encourage looked exactly like
+# the one you least want.
+cat > "$WORK/bin/alert-me" <<SH
+#!/bin/sh
+echo "\$1" > "$WORK/alerted"
+SH
+chmod +x "$WORK/bin/alert-me"
+
+job escalating 'description: stops and asks' 'tools: read, escalate' 'produces: work/never2.txt'
+run 32 "an escalation is a deliberate stop, and outranks the unmet contract" escalating \
+    FAKE_PI_ESCALATE="the routing rules do not cover this ticket" \
+    AGENT_RUN_ALERT_CMD=alert-me
+[ -f "$WORK/alerted" ] \
+  && ok "the alert command fired — an escalation nobody sees is no escalation" \
+  || no "AGENT_RUN_ALERT_CMD did not fire for an escalation"
+grep -q "routing rules do not cover" "$WORK/data/logs/runs/escalating/last.json" \
+  && ok "the reason is in the run record, not only in a file somewhere" \
+  || no "the escalation reason was not recorded in meta.json"
+
+job escalating-undeclared 'description: does not declare the tool' 'tools: read'
+out=$(agent-run escalating-undeclared --dry-run 2>&1)
+case "$out" in
+  *escalate.ts*) no "the escalate extension loads for a job that did not declare the tool" ;;
+  *)             ok "a job that did not declare escalate does not get the extension" ;;
+esac
+
+echo
+echo "== the escalate tool itself writes what a human needs =="
+# The extension has no dependencies, so it can be driven directly with a fake pi.
+cat > "$WORK/esc.mjs" <<'JS'
+import ext from "./agent/extensions/escalate.ts";
+let tool;
+await ext({ registerTool: (t) => { tool = t; }, on: () => {} });
+if (!tool || tool.name !== "escalate") { console.error("not registered"); process.exit(2); }
+const r = await tool.execute("c1", { reason: "needs a human", detail: "found two prices" });
+console.log(JSON.stringify(r));
+JS
+export AGENT_ESCALATION_DIR="$WORK/data/work/escalations"
+export AGENT_ESCALATION_MARKER="$WORK/data/marker"
+export AGENT_RUN_ID="run000000001" AGENT_JOB="somejob"
+if (cd "$WORK" && node --experimental-strip-types esc.mjs >/dev/null 2>&1); then
+  ok "the extension registers and runs"
+else
+  no "the escalate extension did not run"
+fi
+python3 - "$WORK/data/work/escalations" <<'PY' && ok "the request names the run, the job and the reason" || no "the escalation file is missing or incomplete"
+import glob, json, sys
+f = sorted(glob.glob(sys.argv[1] + "/*.json"))
+assert f, "no escalation written"
+d = json.load(open(f[-1]))
+assert d["run"] == "run000000001" and d["job"] == "somejob", d
+assert d["reason"] == "needs a human" and "two prices" in d["detail"], d
+PY
+[ -s "$WORK/data/marker" ] \
+  && ok "the run is marked, which is what agent-run acts on" \
+  || no "no marker was written"
+perm=$(stat -c %a "$(ls "$WORK/data/work/escalations"/*.json | head -1)")
+[ "$perm" = 600 ] \
+  && ok "the request is 0600 — it quotes whatever the agent was looking at" \
+  || no "the escalation file is mode $perm, expected 600"
+
+echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]

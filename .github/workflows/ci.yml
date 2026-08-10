@@ -149,6 +149,15 @@ jobs:
 
           run agent-init --check
           run agent-run --list
+
+          # The bare template is a framework, not a deployment. It must SAY so rather than
+          # idling healthy and silent, which is the way a half-finished fork fails at a client.
+          if run agent-status --ready; then
+            echo "expected the unconfigured template to report itself not ready"; exit 1
+          fi
+          out=$(run agent-status --ready || true)
+          echo "$out" | grep -q "no jobs"    || { echo "--ready did not name the missing jobs"; exit 1; }
+          echo "$out" | grep -q "no context" || { echo "--ready did not name the missing context"; exit 1; }
           echo "$(run agent-mcp check)"  | grep -q "no MCP servers configured"
           echo "$(run kb schema)"        | grep -q "SQLite FTS5"
 

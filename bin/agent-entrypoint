@@ -18,12 +18,15 @@ agent-init || {
 
 case "${1:-idle}" in
   idle)
-    echo "agent: ready. /data prepared. Run a job with: agent-run <job>"
-    # The two questions an operator asks first, answered in the platform's log tab without
-    # exec'ing into anything: is it configured, and did it keep its memory? Only in this
-    # branch — `run` and `exec` must keep stdout clean for callers parsing --json.
+    echo "agent: /data prepared."
+    # The questions an operator asks first, answered in the platform's log tab without exec'ing
+    # into anything: is this fork finished, is it configured, and did it keep its memory? Only
+    # in this branch — `run` and `exec` must keep stdout clean for callers parsing --json.
     # Never fatal: a container that will not start is worse than one reporting a problem.
-    agent-secret check || true
+    #
+    # --ready comes first and subsumes the credential check. A fork nobody finished idles here
+    # looking perfectly healthy forever, so this is the one place it can still be caught.
+    agent-status --ready || true
     echo
     agent-status --memory || true
     # Not `sleep infinity`: a container that cannot be signalled cleanly takes the full

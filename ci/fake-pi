@@ -14,6 +14,9 @@
 #
 #   FAKE_PI_WRITE=path[:content]   create this file (relative to CWD, which agent-run sets to
 #                                  /data) before returning. Repeatable, comma-separated.
+#   FAKE_PI_ESCALATE=<reason>      mark the run as escalated, as the escalate tool does, so
+#                                  agent-run's side of that contract can be tested without a
+#                                  model deciding to call it
 #   FAKE_PI_SILENT=1               return with no assistant text at all -> agent-run sees 30
 #   FAKE_PI_ERROR=<message>        return an assistant message with stopReason=error
 #   FAKE_PI_EXIT=<n>               exit with this code (default 0 — the real pi exits 0 even
@@ -32,6 +35,14 @@ for spec in filter(None, os.environ.get("FAKE_PI_WRITE", "").split(",")):
         os.makedirs(d, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
+
+esc = os.environ.get("FAKE_PI_ESCALATE")
+if esc:
+    marker = os.environ.get("AGENT_ESCALATION_MARKER", "")
+    if marker:
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "a", encoding="utf-8") as fh:
+            fh.write(esc + "\n")
 
 msg = {
     "role": "assistant",

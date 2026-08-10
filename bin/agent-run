@@ -20,6 +20,7 @@
 #   22  timed out
 #   30  ran, but produced no result
 #   31  ran and claimed to be done, but the outcome contract was not met
+#   32  stopped deliberately and asked for a human (the agent called `escalate`)
 #   40  internal error
 #
 # 10 is the important one: a misconfigured deployment must cost nothing and must say which
@@ -235,6 +236,17 @@ fi
 
 [ -n "${JOB_MCP:-}" ] && ARGS+=(-e "$APP/agent/extensions/mcp-tools.ts")
 
+# The escalate tool exists only for a job that declared it. The ceiling applies to the safe
+# path exactly as it does to the dangerous ones: a tool that appears without being declared is
+# the class of surprise --tools exists to make impossible, and carving out an exception for a
+# well-meaning tool would end that guarantee for all of them.
+case ",${JOB_TOOLS:-}," in
+  *,escalate,*)
+    [ -f "$APP/agent/extensions/escalate.ts" ] \
+      || die "job '$JOB' declares the escalate tool but agent/extensions/escalate.ts is missing"
+    ARGS+=(-e "$APP/agent/extensions/escalate.ts") ;;
+esac
+
 if [ -n "${JOB_SKILLS:-}" ]; then
   for s in $JOB_SKILLS; do
     if   [ -e "$DATA/skills/$s" ];          then ARGS+=(--skill "$DATA/skills/$s")
@@ -312,6 +324,14 @@ STAMP=$(date -u '+%Y%m%dT%H%M%SZ')
 RUN_DIR="$RUNS/$JOB/$STAMP-$RUN_ID"
 mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR" || die "cannot create $RUN_DIR"
 
+# Identity for the extensions that record things. Exported unconditionally, because both the
+# action ledger and an escalation have to be attributable to a run, and an extension left to
+# derive this itself would derive it wrongly on exactly the fork with an unusual layout.
+export AGENT_RUN_ID="$RUN_ID"
+export AGENT_JOB="$JOB"
+export AGENT_ESCALATION_DIR="$DATA/work/escalations"
+export AGENT_ESCALATION_MARKER="$RUN_DIR/escalated"
+
 # Retention is a privacy control as much as a disk one: run records hold whatever the agent
 # read from the client's systems.
 KEEP="$(cfg AGENT_RUN_KEEP 30)"
@@ -340,8 +360,6 @@ if [ -n "${JOB_MCP:-}" ]; then
   # wrong on a fork with a different layout, and it would fail silently by writing somewhere
   # nobody looks. Not set for --probe-tools, which never calls a tool.
   export AGENT_EFFECTS_LOG="$DATA/logs/effects.jsonl"
-  export AGENT_RUN_ID="$RUN_ID"
-  export AGENT_JOB="$JOB"
 fi
 
 START=$(date -u +%s)
@@ -470,6 +488,18 @@ PY
 [ -n "${COST:-}" ] || COST=0
 [ -n "${TOKENS:-}" ] || TOKENS=0
 
+# ---------------------------------------------------------------- a deliberate stop
+# An escalation outranks the contract. A job that escalated did not produce its artefact ON
+# PURPOSE, and reporting that as "claimed to be done but was not" would blame the agent for
+# doing precisely the right thing — and would teach the next person reading the logs that
+# escalating looks like failing.
+#
+# Only from a clean run: if the provider also fell over, that is the more useful fault.
+if [ "$STATUS" = 0 ] && [ -s "$RUN_DIR/escalated" ]; then
+  STATUS=32
+  head -1 "$RUN_DIR/escalated" > "$RUN_DIR/error.txt"
+fi
+
 # ---------------------------------------------------------------- the outcome contract
 # The model saying it is finished is not evidence that it is. If the job declared what its work
 # must leave behind, that is checked here, by something the model cannot talk out of it.
@@ -539,7 +569,14 @@ with open(sys.argv[1], 'a') as fh:
 PY
 cp "$RUN_DIR/meta.json" "$RUNS/$JOB/last.json" 2>/dev/null
 
-if [ "$STATUS" != 0 ]; then
+if [ "$STATUS" = 32 ]; then
+  # Not a failure, and it must not read like one — an agent that stops rather than guesses is
+  # doing the thing context/ asked for. It still alerts, because an escalation nobody sees is
+  # the same as no escalation.
+  echo "agent-run: '$JOB' escalated and stopped: $(head -1 "$RUN_DIR/escalated")" >&2
+  echo "  the request is in $DATA/work/escalations/" >&2
+  [ -n "${AGENT_RUN_ALERT_CMD:-}" ] && $AGENT_RUN_ALERT_CMD "$RUN_DIR" >/dev/null 2>&1
+elif [ "$STATUS" != 0 ]; then
   echo "agent-run: '$JOB' failed (exit $STATUS). Details: $RUN_DIR" >&2
   if [ "$STATUS" = 31 ]; then
     # The model finished and was pleased with itself. Say what it actually failed to do,
