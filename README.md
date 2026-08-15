@@ -194,3 +194,15 @@ plainly when one is exposed this way.
 `/data/.env` (mode 0600, inside the volume) avoids it entirely: read on demand, never exported,
 never in the platform's database. The cost is that rotating a value means opening a terminal in
 the container. Pick per client; `DEPLOY.md` §2 has both recipes.
+
+## Licence and contact
+
+MIT — see `LICENSE`. Fork it, ship it to a client, charge for it.
+
+Questions, bug reports and "this behaved differently than documented": open an issue, or write
+to **support@altneu.dev**.
+
+One thing that belongs in mail rather than an issue: anything carrying a client's credentials,
+hostnames or ticket contents. A run directory under `/data/logs/runs/` quotes whatever the
+agent was reading, which is why those files are 0600 — pasting one into a public issue undoes
+that in a way nobody can take back.
