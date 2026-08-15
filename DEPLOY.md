@@ -98,7 +98,16 @@ Then confirm the platform did not quietly drop a guardrail while rewriting the c
 ```bash
 C=<container>
 docker inspect $C --format '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ReadonlyRootfs}}'
-# want: 2147483648 512 true
+# want: 4294967296 512 true
+
+# The heap cap is the other half of that memory limit, and the one a platform is most likely
+# to erase — an env field left blank arrives as an empty string and overrides the image.
+docker compose exec agent \
+  node -e 'console.log(require("v8").getHeapStatistics().heap_size_limit/1048576)'
+# want: ~816 on Node 22 — 768 of old space plus the young generation. The exact figure moves
+# with the Node version; what matters is that it is nowhere near the uncapped one, which
+# tracks the HOST's RAM and so is larger on a bigger box. Above 1000, the cap did not
+# arrive, and this deployment will be killed by the kernel rather than report an error.
 
 # Which variables actually arrived. Prints presence, never values.
 docker inspect $C --format '{{range .Config.Env}}{{println .}}{{end}}' \
