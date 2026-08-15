@@ -84,10 +84,26 @@ RUN printf 'PATH=/app/bin:$PATH\n' > /etc/profile.d/10-agent-path.sh
 # works with no volume attached at all — useful for CI and for `docker run` smoke tests.
 RUN mkdir -p /data && chown "${AGENT_UID}:${AGENT_GID}" /data
 
+# NODE_OPTIONS caps V8's old space, because nothing else will. Node is not cgroup-aware: it
+# sizes the heap from /proc/meminfo, which reports the HOST's RAM, so inside a 2 GiB
+# container it still plans for a ~1 GB heap and refuses to collect below it. That is one
+# process; a session is several (pi, its MCP servers, the tools they spawn), all charged to
+# one cgroup, so one long transcript is enough to reach the limit. The kernel then resolves
+# it with SIGKILL — no stack, no log line, `docker ps` still green.
+#
+# The cap is not about saving memory. It converts a silent kill into a catchable JS heap
+# error, which is the difference between a run that reports failure and a container that
+# quietly restarts a loop. Raising mem_limit alone does not fix it; it moves the wall.
+#
+# 768 MB against compose.yml's 4g leaves room for the sibling processes and the young
+# generation. Change it together with mem_limit, never on its own. As an ENV rather than a
+# shell profile it also reaches `docker exec` without `-l`, which is how most tooling and
+# every healthcheck enters the container.
 ENV AGENT_APP=/app \
     AGENT_DATA=/data \
     HOME=/data \
     PATH=/app/bin:$PATH \
+    NODE_OPTIONS=--max-old-space-size=768 \
     PI_CODING_AGENT_DIR=/data/.pi/agent
 
 USER ${AGENT_UID}:${AGENT_GID}

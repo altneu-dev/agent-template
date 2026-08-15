@@ -61,6 +61,16 @@ services:
       AGENT_ENV: "${AGENT_ENV}"
       # Recorded per boot when the platform provides it. A label; never load-bearing.
       SOURCE_COMMIT: "${SOURCE_COMMIT:-}"
+      # V8's heap cap. The Dockerfile sets this too and explains why; it is repeated here
+      # because a platform passes only what this file names, and an operator who needs to
+      # retune it has nowhere else to type.
+      #
+      # THE DEFAULT IS REPEATED ON PURPOSE, against the rule above. Written bare, an unset
+      # NODE_OPTIONS reaches the container as an empty string and empty OVERRIDES the image's
+      # ENV — the cap would be silently removed by the very line that exists to carry it.
+      # `${VAR:-}` would do the same. So this one spells its default out, like TZ, and a UI
+      # shows it prefilled and editable. Keep it in step with mem_limit below.
+      NODE_OPTIONS: "${NODE_OPTIONS:---max-old-space-size=768}"
 
     # Belt to the environment block's braces: for a plain `docker compose up` with a local
     # .env file. Delete these two lines if a platform's compose parser rejects the long
@@ -80,7 +90,16 @@ services:
     tmpfs:
       - /tmp:size=64m,mode=1777
     pids_limit: 512
-    mem_limit: 2g
+    # 4g, not 2g. A session is not one process: the harness, its MCP servers and the tools
+    # they spawn are all charged to this cgroup, ~1 GB of them resident before any work
+    # starts. At 2g a single long transcript reached the ceiling and the kernel killed the
+    # largest task — CONSTRAINT_MEMCG, on a host with RAM to spare, with nothing in
+    # `docker logs` and the container still reporting healthy.
+    #
+    # This number and NODE_OPTIONS above are one setting in two places. The cap is what makes
+    # the failure catchable; the headroom is what keeps the siblings from being collateral.
+    # Lowering this without lowering the cap re-arms the OOM killer.
+    mem_limit: 4g
     # No mem_swappiness: cgroup v2 has no per-container swappiness, and runtimes either warn
     # and discard it or refuse to start. It bought almost nothing next to mem_limit, and the
     # cost was a one-click deploy dying on a client's box. Do not re-add it.
