@@ -406,34 +406,51 @@ cd "$DATA" || die "cannot enter $DATA"
 # else. Not `--api-key`, which would put the secret in `ps` and in /proc/<pid>/cmdline for
 # every process on the host to read. Not `set -a; . .env`, which would export every value to
 # every descendant including whatever an MCP server spawns.
-case "${AGENT_API_KEY_VAR:-}" in
+# A PROVIDER IS MORE THAN A KEY. One variable was enough only while the answer was always
+# "the vendor's public API". A deployment that may not send client data to a third party —
+# administration, healthcare, defence — reaches its model somewhere it can name: Azure OpenAI
+# in an EU region, or Bedrock in eu-central-1. Those need an endpoint as well as a credential,
+# and an endpoint that does not arrive fails as an authentication error against the wrong host.
+#
+# Names are listed here, never values: each is resolved through agent-secret, so the value may
+# sit in /data/.env and stay out of the container's environment entirely. That is the whole
+# point for a client who will not put a credential into a platform's database — and it is why
+# these cannot simply be left to the container env, which every process here can read.
+case "${AGENT_PROVIDER_VARS:-${AGENT_API_KEY_VAR:-}}" in
   "") case "$PROVIDER" in
-        anthropic*) KEY_VAR=ANTHROPIC_API_KEY ;;
-        openai*)    KEY_VAR=OPENAI_API_KEY ;;
-        google*|gemini*) KEY_VAR=GEMINI_API_KEY ;;
-        *)          KEY_VAR="" ;;
+        anthropic*)      PROVIDER_VARS="ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN" ;;
+        openai)          PROVIDER_VARS="OPENAI_API_KEY" ;;
+        azure*)          PROVIDER_VARS="AZURE_OPENAI_API_KEY AZURE_OPENAI_BASE_URL
+                                        AZURE_OPENAI_RESOURCE_NAME AZURE_OPENAI_API_VERSION
+                                        AZURE_OPENAI_DEPLOYMENT_NAME_MAP" ;;
+        bedrock*|aws*)   PROVIDER_VARS="AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID
+                                        AWS_SECRET_ACCESS_KEY AWS_REGION AWS_PROFILE" ;;
+        google*|gemini*) PROVIDER_VARS="GEMINI_API_KEY GOOGLE_API_KEY" ;;
+        *)               PROVIDER_VARS="" ;;
       esac ;;
-  *)  KEY_VAR="$AGENT_API_KEY_VAR" ;;
+  # AGENT_PROVIDER_VARS names the set for a provider this table does not know. The older
+  # AGENT_API_KEY_VAR still works and means the same thing for a single variable.
+  *)  PROVIDER_VARS="${AGENT_PROVIDER_VARS:-$AGENT_API_KEY_VAR}" ;;
 esac
 
-KEY_VALUE=""
-if [ -n "$KEY_VAR" ]; then
-  KEY_VALUE=$(agent-secret get "$KEY_VAR" 2>/dev/null) || KEY_VALUE=""
-  # Google also accepts GOOGLE_API_KEY; try the alternative before giving up, so a working
-  # deployment is not rejected over a naming preference.
-  if [ -z "$KEY_VALUE" ] && [ "$KEY_VAR" = GEMINI_API_KEY ]; then
-    KEY_VALUE=$(agent-secret get GOOGLE_API_KEY 2>/dev/null) || KEY_VALUE=""
-    [ -n "$KEY_VALUE" ] && KEY_VAR=GOOGLE_API_KEY
-  fi
-fi
+# A provider needs SOME of its variables, not all: Azure takes either a base URL or a resource
+# name, Bedrock either a bearer token or an access-key pair, Google either name for its key.
+# Deciding which combination is valid is the provider's job. What matters here is that an
+# unresolved name is left out rather than passed as an empty string — an empty AWS_PROFILE is
+# not the same as no AWS_PROFILE, and an empty AZURE_OPENAI_BASE_URL overrides a good one.
+PROVIDER_ENV=()
+for v in $PROVIDER_VARS; do
+  val=$(agent-secret get "$v" 2>/dev/null) || val=""
+  [ -n "$val" ] && PROVIDER_ENV+=("$v=$val")
+done
 
-if [ -n "$KEY_VAR" ] && [ -n "$KEY_VALUE" ]; then
-  env "$KEY_VAR=$KEY_VALUE" \
+if [ ${#PROVIDER_ENV[@]} -gt 0 ]; then
+  env "${PROVIDER_ENV[@]}" \
     timeout --signal=TERM --kill-after=20 "$TIMEOUT" \
     pi "${ARGS[@]}" "$PROMPT" </dev/null >"$RUN_DIR/result.jsonl" 2>"$RUN_DIR/stderr.log"
 else
-  # No mapped variable: pi falls back to whatever is already in the environment, which is how
-  # a platform-injected credential for an unmapped provider still works.
+  # Nothing resolved: pi falls back to whatever is already in the environment, which is how a
+  # platform-injected credential for a provider this table does not know still works.
   timeout --signal=TERM --kill-after=20 "$TIMEOUT" \
     pi "${ARGS[@]}" "$PROMPT" </dev/null >"$RUN_DIR/result.jsonl" 2>"$RUN_DIR/stderr.log"
 fi

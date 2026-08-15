@@ -52,6 +52,21 @@ services:
       GEMINI_API_KEY: "${GEMINI_API_KEY}"
       AGENT_PROVIDER: "${AGENT_PROVIDER}"
       AGENT_MODEL: "${AGENT_MODEL}"
+      # Reaching a model in a jurisdiction the client can name. Bare, like the other
+      # credentials: nothing in the image sets these, so an empty one overrides nothing.
+      # They are listed for the same reason as everything else here — a platform passes only
+      # what this file names, and a base URL that silently does not arrive fails later as an
+      # authentication error against the vendor's public endpoint, which is the one place the
+      # data was not supposed to go.
+      AZURE_OPENAI_API_KEY: "${AZURE_OPENAI_API_KEY}"
+      AZURE_OPENAI_BASE_URL: "${AZURE_OPENAI_BASE_URL}"
+      AZURE_OPENAI_RESOURCE_NAME: "${AZURE_OPENAI_RESOURCE_NAME}"
+      AZURE_OPENAI_API_VERSION: "${AZURE_OPENAI_API_VERSION}"
+      AZURE_OPENAI_DEPLOYMENT_NAME_MAP: "${AZURE_OPENAI_DEPLOYMENT_NAME_MAP}"
+      AWS_BEARER_TOKEN_BEDROCK: "${AWS_BEARER_TOKEN_BEDROCK}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
+      AWS_REGION: "${AWS_REGION}"
       AGENT_RUN_TIMEOUT: "${AGENT_RUN_TIMEOUT}"
       AGENT_RUN_KEEP: "${AGENT_RUN_KEEP}"
       AGENT_RUN_ALERT_CMD: "${AGENT_RUN_ALERT_CMD}"

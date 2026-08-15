@@ -236,6 +236,51 @@ platform's scheduler.
   no memory. Redeploy instead.
 - **Enable volume pruning** on the server.
 
+## 9. Sending the data somewhere the client can name
+
+For public administration, healthcare and defence the first question is not which model. It is
+which jurisdiction, under which contract, and who can be asked about it afterwards. A deploy
+that answers everything else and sends the payload to a vendor's public API has answered
+nothing.
+
+Two routes work with this image today. Both are the same three steps: set `AGENT_PROVIDER`,
+set that provider's variables, redeploy.
+
+| | `AGENT_PROVIDER` | The variables that matter | Where the data goes |
+|---|---|---|---|
+| **Azure OpenAI** | `azure` | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL` | the region you created the resource in |
+| **Amazon Bedrock** | `bedrock` | `AWS_BEARER_TOKEN_BEDROCK` (or the key pair) + `AWS_REGION` | the region in `AWS_REGION` |
+
+`agent-run` passes a provider's **whole set** into the model process, not just the key — so the
+endpoint may live in `/data/.env` alongside the credential and never appear in the platform's
+database. Names are in `.env.example`; a fork makes them mandatory by marking them
+`<required>` there and commenting out `ANTHROPIC_API_KEY`.
+
+Verify it before anyone relies on it, because the failure is quiet in the wrong direction:
+
+```bash
+docker compose exec agent agent-secret check     # names the source of each variable
+docker compose exec agent agent-run <job>        # then read logs/effects.jsonl
+```
+
+A missing endpoint does not fail as "no endpoint". It falls back to the vendor's public API and
+fails as an authentication error — or worse, succeeds, if a public-API key is also present. If
+you promised a client that data stays in Frankfurt, check the endpoint arrived, not that the
+run worked.
+
+### A model on the client's own hardware
+
+**Not supported today, and it is worth saying plainly rather than implying otherwise.** Pi has
+no generic base-URL override — only the provider-specific ones above. Nothing in this image
+speaks to vLLM, Ollama or llama.cpp.
+
+The route that does work is a proxy on the client's own network that presents the Azure OpenAI
+API in front of whatever is actually running, with `AZURE_OPENAI_BASE_URL` pointed at it. That
+is the client's infrastructure and the client's problem, and it is a real project — API-shape
+compatibility, TLS, a model that is good enough to be worth the exercise. Price it before you
+promise it. If on-premise inference is the requirement rather than a preference, this template
+is not finished for that case yet.
+
 ## Dokploy, and plain Docker
 
 Dokploy reads the same `compose.yml` and the same caveats apply — it also derives volume

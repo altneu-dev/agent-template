@@ -210,6 +210,42 @@ else
 fi
 
 echo
+echo "== a provider is more than a key, and only its own variables travel =="
+# For a deployment that may not send data to a vendor's public API, the endpoint is the whole
+# point of the choice. It has to reach the model process from the SECRETS FILE — a value that
+# only works when it sits in the container's environment is a value every process here can
+# read, which is what /data/.env exists to avoid. So these are written to the file, not passed
+# as environment: passing them would prove nothing, because pi inherits the environment anyway.
+cat >> "$WORK/data/.env" <<'SECRETS'
+AZURE_OPENAI_API_KEY=azure-not-a-real-key
+AZURE_OPENAI_BASE_URL=https://example-eu.openai.azure.com
+SECRETS
+
+job azure-job 'description: reaches a model in a named jurisdiction' 'tools: read'
+run 0 "a run against azure starts" azure-job \
+    AGENT_PROVIDER=azure FAKE_PI_ENV_DUMP="$WORK/pi-env.txt"
+
+if grep -qx AZURE_OPENAI_BASE_URL "$WORK/pi-env.txt" 2>/dev/null; then
+  ok "the endpoint reached the model process, from the file"
+else
+  no "AZURE_OPENAI_BASE_URL did not reach pi — the deployment would fall back to the public API"
+fi
+if grep -qx AZURE_OPENAI_API_KEY "$WORK/pi-env.txt" 2>/dev/null; then
+  ok "so did the credential — a provider's whole set travels, not just one variable"
+else
+  no "AZURE_OPENAI_API_KEY did not reach pi"
+fi
+
+# The other half, and the one that keeps the first honest: everything else in the secrets file
+# stays out. ANTHROPIC_API_KEY is in /data/.env for every other test in this file, so if the
+# new code exported the file wholesale rather than the provider's own names, this catches it.
+if grep -qx ANTHROPIC_API_KEY "$WORK/pi-env.txt" 2>/dev/null; then
+  no "a credential for a DIFFERENT provider reached the model process"
+else
+  ok "another provider's credential stayed out of the model process"
+fi
+
+echo
 echo "== stopping to ask is not the same as failing =="
 # Before this, "escalated" and "silently did nothing" produced identical runs: exit 0, no
 # artefacts, a polite summary. The behaviour you most want to encourage looked exactly like
