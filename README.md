@@ -76,6 +76,13 @@ in its runtime. A *commit* job declares the mutating tool and `requires:` the pr
 worth more than a confirmation step, because it does not depend on anyone reading the
 confirmation. `examples/helpdesk/` is the worked version.
 
+The ceiling is per job, so the split holds only while a run cannot start another run. It
+cannot: `agent-run` exits `11` when called from inside one. Without that, a job declaring
+`bash` would reach `/app/bin/agent-run`, which is on `PATH` for everything a run spawns and
+re-derives the credential from `/data/.env` on its own — and one shell in one job would hand
+every job's tools to that job. `bash` in a `tools:` line is therefore the whole security review
+of a job; `agent/jobs/README.md` says what it costs.
+
 ## Proof that the work happened
 
 The tool ceiling bounds the damage. It cannot tell you the work was done — an agent that reads

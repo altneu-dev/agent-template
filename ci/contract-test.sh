@@ -133,6 +133,32 @@ job silent 'description: says nothing at all' 'tools: read' 'produces: work/neve
 run 30 "no result at all stays 30, the contract does not overwrite it" silent FAKE_PI_SILENT=1
 
 echo
+echo "== a run cannot start another run =="
+# The tool ceiling is declared per job, so propose/commit is only a guarantee while nesting is
+# impossible. A job with a shell reaches /app/bin/agent-run — it is on PATH for every
+# descendant — and agent-run re-derives the credential from /data/.env, so it needs nothing its
+# parent was given. Without this refusal, one `bash` in one job would hand every job's tools to
+# that job. Asserted here rather than reviewed, because the reviewer would be looking at a
+# different file from the one that grants the shell.
+job no-nesting 'description: a perfectly ordinary job' 'tools: read'
+run 11 "agent-run refuses to start when the caller is itself a run" no-nesting \
+    AGENT_RUN_ID=deadbeef1234 AGENT_JOB=the-parent
+[ ! -d "$WORK/data/logs/runs/no-nesting" ] \
+  && ok "the refused run left no record — it never started" \
+  || no "a refused nested run created a run record"
+
+# The other half, and the one that makes the first meaningful: a guard that refuses everything
+# would also pass the test above.
+run 0 "the same job runs normally when nothing is nesting it" no-nesting
+
+# Read-only diagnostics stay usable from inside a run, which is why the guard sits where it
+# does. They cannot start anything, and needing to leave the container to ask what a job
+# declares is how people stop asking.
+AGENT_RUN_ID=deadbeef1234 agent-run no-nesting --dry-run >/dev/null 2>&1 \
+  && ok "--dry-run still answers from inside a run" \
+  || no "the guard also blocked a read-only diagnostic"
+
+echo
 echo "== stopping to ask is not the same as failing =="
 # Before this, "escalated" and "silently did nothing" produced identical runs: exit 0, no
 # artefacts, a polite summary. The behaviour you most want to encourage looked exactly like

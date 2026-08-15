@@ -14,7 +14,7 @@
 #
 #    0  ran, produced a result, and met the outcome contract
 #   10  preflight failed — configuration is wrong. NO model call was made, nothing was spent
-#   11  another run of this job is in progress
+#   11  refused: this job is already running, or the caller is itself a run (see below)
 #   20  provider or authentication error — configuration is wrong, do NOT retry
 #   21  provider temporarily unavailable (rate limit, overload) — safe to retry
 #   22  timed out
@@ -31,6 +31,11 @@
 # can now declare what its work must leave behind, and the harness checks it rather than
 # taking the model's word. Kept distinct from 30 because they need opposite responses: 30 is
 # usually the provider, 31 is the agent.
+#
+# 11 covers two refusals, because a scheduler's answer to both is the same one: leave it alone.
+# The second is new and no scheduler will ever see it — a run tried to start another run. That
+# path exists only from inside a job that declared a shell, and it is refused because the tool
+# ceiling is per job; see the guard further down for why nesting would dissolve it.
 set -uo pipefail
 
 APP="${AGENT_APP:-/app}"
@@ -309,6 +314,37 @@ if [ "$DRY" = 1 ]; then
   echo "command:"
   printf '  pi'; for a in "${ARGS[@]}"; do printf ' %q' "$a"; done; printf ' <prompt>\n'
   exit 0
+fi
+
+# ---------------------------------------------------------------- no run starts a run
+#
+# The tool ceiling is per JOB, which is what makes propose/commit a guarantee rather than a
+# request: the propose job cannot reach the outside system because the mutating tool does not
+# exist in its runtime. That holds only while a run cannot start a different run — otherwise a
+# job with a shell reaches /app/bin/agent-run, which is on PATH for every descendant, and
+# re-derives the credential from /data/.env on its own. Its parent's ceiling would never come
+# into it. One `bash` in one job would lift the separation for every job in the container.
+#
+# So the invariant is enforced here rather than left to review: AGENT_RUN_ID is set for the
+# duration of a run and inherited by everything the run spawns. Finding it set means we are
+# inside one.
+#
+# Checked at this point, and not earlier, so that --list, --dry-run and --probe-tools keep
+# working from inside a run. They read; they cannot start anything.
+#
+# What this does NOT do, stated plainly because a control whose limits are unclear gets
+# trusted for more than it does: a job author who wants nesting can `unset AGENT_RUN_ID` and
+# have it. This stops the accident and the prompt-injected instruction — the model does not
+# get to widen its own surface by calling another job — not a fork that has decided otherwise.
+# That is deliberate: an escape hatch nobody can find would only be worked around in a way
+# nobody can see. Blessing one with a flag would turn the decision into a checkbox ticked in
+# the same commit as the risky line.
+if [ -n "${AGENT_RUN_ID:-}" ]; then
+  echo "agent-run: refusing to start '$JOB' from inside run ${AGENT_RUN_ID} of '${AGENT_JOB:-?}'." >&2
+  echo "  A run cannot start another run: the tool ceiling is declared per job, and nesting" >&2
+  echo "  would let one job borrow another job's tools. If this job needs what '$JOB' can do," >&2
+  echo "  declare it in the job file, or split the work across two scheduled jobs." >&2
+  exit 11
 fi
 
 # ---------------------------------------------------------------- one at a time

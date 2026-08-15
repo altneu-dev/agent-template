@@ -31,6 +31,33 @@ called, misconfigured, or talked into existence by hostile input reaching the mo
 Start from the smallest set that works. Widening a job later is a one-line change; noticing
 that it was too wide usually is not.
 
+### `bash` is not one more tool
+
+Every other name in `tools:` widens the surface by one thing. `bash` ends the idea of a
+surface, and it does so for the whole container rather than for this job:
+
+- `/app/bin` is on `PATH` for everything a run spawns, so `agent-run` is reachable.
+- `agent-run` re-derives the credential from `/data/.env` itself. It does not need anything
+  its parent was given.
+
+So a job that declares `bash` can start *any other job* — and get that job's tools, including
+the mutating ones its own `allow:` deliberately withheld. The propose/commit split below stops
+being a guarantee the moment either half has a shell.
+
+The harness refuses the nesting: `agent-run` exits `11` when it is called from inside a run.
+That closes the accident and the injected instruction. It does not make `bash` safe — a shell
+still reads every file in the volume, including `/data/.env`, and reaches every network the
+container reaches. Treat one line as the whole security review of a job:
+
+```
+tools: read, write, bash
+                   ^^^^ this is the review
+```
+
+Most jobs that seem to need a shell do not. A command that must run **after** the agent belongs
+in `verify:`, and a fork's own checkers belong in its `bin/` — both run in the harness, outside
+the model's reach, which is the point.
+
 ## The contract: what it must have done
 
 The tool ceiling bounds the damage. It cannot tell you the work happened — an agent that reads
