@@ -19,6 +19,12 @@
 #                                  model deciding to call it
 #   FAKE_PI_SILENT=1               return with no assistant text at all -> agent-run sees 30
 #   FAKE_PI_ERROR=<message>        return an assistant message with stopReason=error
+#   FAKE_PI_ERROR_THEN=<message>   an errored turn FOLLOWED by a good one — the session
+#                                  recovered. This is the shape a retried rate limit leaves
+#                                  behind, and the shape agent-run has to tell apart from a
+#                                  run that actually ended badly.
+#   FAKE_PI_STDERR=<text>          write this to stderr. Log noise is not evidence about the
+#                                  outcome, and agent-run has to stop treating it as such.
 #   FAKE_PI_EXIT=<n>               exit with this code (default 0 — the real pi exits 0 even
 #                                  when it never reached a model, which is why agent-run
 #                                  judges the stream rather than the exit code)
@@ -57,5 +63,23 @@ if os.environ.get("FAKE_PI_ERROR"):
     msg["stopReason"] = "error"
     msg["errorMessage"] = os.environ["FAKE_PI_ERROR"]
 
-print(json.dumps({"type": "agent_end", "messages": [msg]}))
+messages = []
+recovered = os.environ.get("FAKE_PI_ERROR_THEN")
+if recovered:
+    # An earlier turn that failed, with its own cost — a retry is not free, and agent-run must
+    # still count it. The good turn above follows, so the session as a whole did not end badly.
+    messages.append({
+        "role": "assistant",
+        "stopReason": "error",
+        "errorMessage": recovered,
+        "usage": {"cost": {"total": 0.0007}, "totalTokens": 21},
+        "content": [],
+    })
+messages.append(msg)
+
+noise = os.environ.get("FAKE_PI_STDERR")
+if noise:
+    print(noise, file=sys.stderr)
+
+print(json.dumps({"type": "agent_end", "messages": messages}))
 sys.exit(int(os.environ.get("FAKE_PI_EXIT", "0")))

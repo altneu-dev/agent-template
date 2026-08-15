@@ -449,7 +449,7 @@ END=$(date -u +%s)
 # authoritative list — message_end and turn_end repeat the same message, so summing those
 # would double-count every run's cost.
 read -r STATUS COST TOKENS < <(python3 - "$RUN_DIR/result.jsonl" "$RUN_DIR/stderr.log" "$PI_RC" "$RUN_DIR/error.txt" <<'PY'
-import json, sys
+import json, re, sys
 res, err, rc, errout = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 
 msgs, fallback = [], []
@@ -473,7 +473,13 @@ except OSError:
 if not msgs:
     msgs = fallback
 
-produced, error_msg, cost, tokens = False, '', 0.0, 0
+produced, cost, tokens = False, 0.0, 0
+
+# The error that ENDED the session, not the first one that appeared in it. A turn that failed
+# and was retried successfully is not a failed run. Keeping the first error was how a run that
+# did its work came back as 21 "safe to retry" — which a scheduler answers by running again a
+# commit job that had already committed.
+ended_in_error = None
 for m in msgs:
     if not isinstance(m, dict) or m.get('role') != 'assistant':
         continue
@@ -484,8 +490,7 @@ for m in msgs:
     t = u.get('totalTokens')
     if isinstance(t, int):
         tokens += t
-    if m.get('stopReason') == 'error':
-        error_msg = error_msg or str(m.get('errorMessage', ''))
+    ended_in_error = str(m.get('errorMessage', '')) if m.get('stopReason') == 'error' else None
     content = m.get('content')
     if isinstance(content, list) and any(
             (p.get('text') or '').strip() for p in content if isinstance(p, dict)):
@@ -496,27 +501,60 @@ try:
     stderr = open(err, encoding='utf-8', errors='replace').read()
 except OSError:
     pass
-blob = (error_msg + ' ' + stderr).lower()
-if error_msg:
-    open(errout, 'w').write(error_msg[:2000])
 
 # Auth is a configuration fault and must never be retried; rate limits and overload are
 # transient and should be. A scheduler that cannot tell them apart either hammers a broken
 # credential or gives up on a busy provider.
+#
+# Matched on whole words, because these tokens are short enough to appear inside unrelated
+# text: `500` lives in `1500ms`, and a `permission denied` from reading a file is not an auth
+# fault. Free text is the weakest evidence there is, so it is consulted only about a run with
+# nothing better to go on.
+def fault(text):
+    t = (text or '').lower()
+    if re.search(r'\b(401|403)\b', t) or any(s in t for s in (
+            'authentication', 'invalid x-api-key', 'invalid api key', 'no api key',
+            'unauthorized', 'permission_error')):
+        return 20
+    if re.search(r'\b(429|500|502|503|529)\b', t) or any(s in t for s in (
+            'rate limit', 'overloaded', 'capacity', 'timeout', 'econnreset')):
+        return 21
+    return None
+
+# ORDER MATTERS, and this is it:
+#
+#   1. killed by the timeout        the harness knows this first-hand
+#   2. the session ENDED in a fault we recognise
+#   3. it produced something        then it ran, and the outcome contract judges the rest
+#   4. nothing at all               classify from whatever text exists, else 30/40
+#
+# 3 sits above the text matching deliberately. Before, any provider-shaped substring anywhere
+# in the run's stderr outranked the fact that the work was done — and because the contract is
+# only evaluated for a run that otherwise succeeded, the misclassified run skipped its own
+# `produces:`/`verify:` check on the way out. The check most likely to catch a lie was the one
+# turned off by a number in a log line.
+#
+# An error we cannot classify no longer decides anything by itself: the run falls through to
+# `produced` and the contract, which is the stronger evidence and does not depend on a
+# provider's choice of wording.
+end_fault = fault(ended_in_error) or fault(stderr) if ended_in_error is not None else None
 if rc in (124, 137):
     status = 22
-elif any(s in blob for s in ('401', 'authentication', 'invalid x-api-key', 'invalid api key',
-                             'no api key', 'unauthorized', '403', 'permission')):
-    status = 20
-elif any(s in blob for s in ('429', 'rate limit', 'overloaded', 'capacity', '529',
-                             '500', '502', '503', 'timeout', 'econnreset')):
-    status = 21
+elif end_fault:
+    status = end_fault
 elif produced:
     status = 0
+elif fault(stderr):
+    status = fault(stderr)
 elif rc != 0:
     status = 40
 else:
     status = 30
+
+# Only for a run that actually ended badly. A recovered turn used to leave an error.txt behind
+# on a successful run, which is a fault report for something that did not fail.
+if ended_in_error:
+    open(errout, 'w').write(ended_in_error[:2000])
 print(status, round(cost, 6), tokens)
 PY
 )
