@@ -187,7 +187,44 @@ A host-side cron is the part that makes the failure survivable:
 Keep it off the same disk as the data. A backup that dies with the machine is a copy, not a
 backup.
 
-## 7. Running jobs on a schedule
+## 7. Prove someone hears about it — send one alert
+
+Same move as step 4, for a different property. A deployment nobody is watching is the normal
+case, not the degraded one: jobs run on a schedule, at night, while everyone is asleep. Two
+outcomes need a person and cannot wait for one to happen to look — `31`, where the agent said
+it was done and the harness disagreed, and `32`, where the agent stopped and asked. Neither is
+worth anything if the message goes nowhere.
+
+Set an incoming webhook the client already reads — a Teams or Slack channel, or their ticket
+system's intake URL — and point the harness at it:
+
+```
+AGENT_RUN_ALERT_CMD=agent-alert
+AGENT_ALERT_WEBHOOK=https://…
+```
+
+Then, in a terminal on the deployment:
+
+```bash
+agent-status --ready         # names a missing or unusable alert path
+agent-alert --test           # sends one now — go and look at the channel
+```
+
+`--ready` checks that a path is configured; only `--test` shows it arrives. They are different
+claims, and the gap between them is a wrong URL, a revoked webhook, or a firewall.
+
+What it sends is deliberately thin: job name, exit code, run id, and the first line of the
+reason. Not the escalation request and not the run's output — those quote whatever the agent
+was reading in the client's systems, which is why they stay 0600 in the volume. If a client
+decides the full reason may leave, `AGENT_ALERT_VERBOSE=1` opts in.
+
+If the client will not allow outbound traffic at all — a fair position in the environments
+this is built for — leave `AGENT_RUN_ALERT_CMD` unset and say so out loud in the handover.
+`agent-status --health` still reports failures and escalations to a monitoring system that
+polls from outside, and that is then the agreed path. What must not happen is a deployment
+that everyone assumes is alerting and is not.
+
+## 8. Running jobs on a schedule
 
 Coolify → Scheduled Tasks, container command `agent-run <job>`. Exit codes are the interface:
 
@@ -211,7 +248,7 @@ the request is waiting in `/data/work/escalations/`.
 Host cron with `docker exec` works identically if you would rather not depend on the
 platform's scheduler.
 
-## 8. Day two
+## 9. Day two
 
 - **Rotate a secret:** change it in the UI → Redeploy → `agent-secret check`.
 - **What did it change in our systems?** `agent-status --effects`. Every external effect is an
@@ -236,7 +273,7 @@ platform's scheduler.
   no memory. Redeploy instead.
 - **Enable volume pruning** on the server.
 
-## 9. Sending the data somewhere the client can name
+## 10. Sending the data somewhere the client can name
 
 For public administration, healthcare and defence the first question is not which model. It is
 which jurisdiction, under which contract, and who can be asked about it afterwards. A deploy

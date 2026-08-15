@@ -70,6 +70,11 @@ services:
       AGENT_RUN_TIMEOUT: "${AGENT_RUN_TIMEOUT}"
       AGENT_RUN_KEEP: "${AGENT_RUN_KEEP}"
       AGENT_RUN_ALERT_CMD: "${AGENT_RUN_ALERT_CMD}"
+      # Where a failure or an escalation goes. Named here for the usual reason — a webhook this
+      # file does not name is one an operator sets and watches do nothing, and the failure mode
+      # is an agent that correctly stopped to ask a human while nobody was listening.
+      AGENT_ALERT_WEBHOOK: "${AGENT_ALERT_WEBHOOK}"
+      AGENT_ALERT_VERBOSE: "${AGENT_ALERT_VERBOSE}"
       # A vertical's own variables, as NAME=value lines. This file is frozen against
       # verticals but a platform will not pass a variable this file does not name, so one
       # field carries them all. agent-secret parses it with the same grammar as /data/.env.

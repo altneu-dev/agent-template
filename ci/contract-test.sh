@@ -275,6 +275,95 @@ case "$out" in
 esac
 
 echo
+echo "== stopping to ask is not being broken =="
+# Health answers one question: is this deployment broken. An agent that stopped to ask a human
+# is not — and reporting it as unhealthy is answered by platforms that gate deploys on health
+# or restart what they consider sick, i.e. by killing the container waiting for the answer.
+health_out=$(agent-status --health 2>&1 || true)
+if printf '%s' "$health_out" | grep -q "escalated: escalating"; then
+  ok "an escalated run is reported as escalated"
+else
+  no "--health did not mention the escalated run at all"
+fi
+if printf '%s' "$health_out" | grep -q "unhealthy: escalating"; then
+  no "a deliberate stop still marks the deployment unhealthy"
+else
+  ok "and does not mark the deployment unhealthy"
+fi
+if printf '%s' "$health_out" | grep -q "unhealthy: verify-no"; then
+  ok "a real failure still does"
+else
+  no "--health stopped reporting genuine failures"
+fi
+
+echo
+echo "== a deployment that can alert nobody says so =="
+# The one readiness item about the deployment's surroundings rather than its contents, which is
+# why it is the one a fork forgets. Unattended is a promise about who hears, not who runs.
+ready_out=$(agent-status --ready 2>&1 || true)
+if printf '%s' "$ready_out" | grep -q "no alert path"; then
+  ok "--ready names the missing alert path"
+else
+  no "--ready is silent about failures reaching nobody"
+fi
+ready_out=$(AGENT_RUN_ALERT_CMD=agent-alert AGENT_ALERT_WEBHOOK=https://example.invalid/hook \
+            agent-status --ready 2>&1 || true)
+if printf '%s' "$ready_out" | grep -q "no alert path"; then
+  no "--ready still complains once an alert path is wired"
+else
+  ok "and stops once one is wired"
+fi
+ready_out=$(AGENT_RUN_ALERT_CMD=no-such-alerter agent-status --ready 2>&1 || true)
+if printf '%s' "$ready_out" | grep -q "alert command not found"; then
+  ok "an alert command that does not exist is caught before it is needed"
+else
+  no "a missing alert command passed the readiness gate"
+fi
+
+echo
+echo "== an alert that fails is not a silent alert =="
+# The same bug one level up: the mechanism that exists so a human hears about a problem, not
+# saying that it could not tell anyone.
+cat > "$WORK/bin/alert-broken" <<'SH'
+#!/bin/sh
+echo "webhook refused the payload" >&2
+exit 1
+SH
+chmod +x "$WORK/bin/alert-broken"
+job alert-fails 'description: fails, and cannot be reported' 'tools: read' 'produces: work/nope.txt'
+out=$(AGENT_RUN_ALERT_CMD=alert-broken agent-run alert-fails 2>&1); rc=$?
+if [ "$rc" = 31 ]; then ok "the run still reports its own outcome (exit 31)"
+else no "expected exit 31 from the failing job, got $rc"; fi
+if printf '%s' "$out" | grep -q "the alert command failed"; then
+  ok "and says out loud that nobody was told"
+else
+  no "a failed alert was swallowed — the failure mode this exists to prevent"
+fi
+if printf '%s' "$out" | grep -q "webhook refused the payload"; then
+  ok "quoting what the alerter said, so it can be fixed"
+else
+  no "the alerter's own error was not surfaced"
+fi
+
+echo
+echo "== agent-alert refuses to pretend =="
+if AGENT_ALERT_WEBHOOK= agent-alert --check >/dev/null 2>&1; then
+  no "agent-alert --check passed with no webhook configured"
+else
+  ok "no webhook configured is not ready"
+fi
+if AGENT_ALERT_WEBHOOK=https://example.invalid/hook agent-alert --check >/dev/null 2>&1; then
+  ok "an https webhook is"
+else
+  no "a configured https webhook was rejected"
+fi
+if AGENT_ALERT_WEBHOOK=not-a-url agent-alert --check >/dev/null 2>&1; then
+  no "a value that is not a URL passed --check"
+else
+  ok "and something that is not a URL is not"
+fi
+
+echo
 echo "== the escalate tool itself writes what a human needs =="
 # The extension has no dependencies, so it can be driven directly with a fake pi.
 cat > "$WORK/esc.mjs" <<'JS'
