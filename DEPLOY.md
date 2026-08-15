@@ -195,7 +195,7 @@ Coolify → Scheduled Tasks, container command `agent-run <job>`. Exit codes are
 |---|---|---|
 | 0 | ran, produced a result, met its contract | nothing |
 | 10 | misconfigured — **nothing was run, nothing spent** | alert; never retry, the config is wrong |
-| 11 | another run of this job is in progress | ignore |
+| 11 | refused: this job is already running, or the caller was itself a run | ignore |
 | 20 | provider or auth error | alert; do not retry |
 | 21 | provider busy or rate limited | retry later |
 | 22 | timed out | alert |
