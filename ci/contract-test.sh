@@ -159,6 +159,57 @@ AGENT_RUN_ID=deadbeef1234 agent-run no-nesting --dry-run >/dev/null 2>&1 \
   || no "the guard also blocked a read-only diagnostic"
 
 echo
+echo "== a run is judged by how it ENDED, not by every error it survived =="
+# The exit-code classifier had no assertions at all, which is how it came to outrank the
+# outcome contract without anyone noticing. These are the cases that broke.
+
+job recovered-ok 'description: retries, then works' 'tools: write' 'produces: work/recovered.txt'
+run 0 "a turn that failed and was retried is not a failed run" recovered-ok \
+    FAKE_PI_ERROR_THEN="429 rate limit exceeded" FAKE_PI_WRITE="work/recovered.txt:done"
+
+# The one that costs money. The contract is only evaluated for a run that otherwise succeeded,
+# so a run misread as a provider fault skipped its own `produces:` check on the way out — and
+# 21 tells a scheduler to run it again, which for a commit job means committing twice.
+job recovered-lie 'description: retries, then produces nothing' 'tools: write' \
+                  'produces: work/never4.txt'
+run 31 "a recovered run still has to meet its contract" recovered-lie \
+    FAKE_PI_ERROR_THEN="429 rate limit exceeded"
+
+job noisy-log 'description: writes, and logs a duration' 'tools: write' 'produces: work/noisy.txt'
+run 0 "'1500ms' in a log line is not a 500 from the provider" noisy-log \
+    FAKE_PI_STDERR="tool call finished in 1500ms" FAKE_PI_WRITE="work/noisy.txt:ok"
+
+job denied-file 'description: writes, after a refused read' 'tools: write' 'produces: work/denied.txt'
+run 0 "'permission denied' on a file is not an auth fault" denied-file \
+    FAKE_PI_STDERR="open /data/secrets: permission denied" FAKE_PI_WRITE="work/denied.txt:ok"
+
+echo
+echo "== a run that really ends badly is still the fault it is =="
+# The reordering must not cost the classification that a scheduler acts on.
+job provider-fault 'description: never gets an answer' 'tools: read'
+run 20 "an auth failure is 20 — configuration, never retry" provider-fault \
+    FAKE_PI_SILENT=1 FAKE_PI_STDERR="401 unauthorized: invalid x-api-key"
+run 21 "a session that ENDS in a rate limit is 21 — safe to retry" provider-fault \
+    FAKE_PI_ERROR="429 rate limit exceeded"
+run 22 "a run killed by its own timeout is 22" provider-fault FAKE_PI_EXIT=124
+
+# A successful run must not leave a fault report behind for an error it survived: `error` in
+# meta.json is what agent-status shows, and a filled one on a green run sends whoever reads it
+# looking for a failure that did not happen.
+recmeta="$WORK/data/logs/runs/recovered-ok/last.json"
+if grep -q '"exit": *0' "$recmeta" 2>/dev/null; then
+  ok "the recovered run is recorded as the success it was"
+else
+  no "meta.json does not record the recovered run as successful"
+  sed 's/^/        /' "$recmeta" 2>/dev/null | head -6
+fi
+if grep -q '"error": *""' "$recmeta" 2>/dev/null; then
+  ok "and carries no error report for the turn it survived"
+else
+  no "a successful run recorded an error it recovered from"
+fi
+
+echo
 echo "== stopping to ask is not the same as failing =="
 # Before this, "escalated" and "silently did nothing" produced identical runs: exit 0, no
 # artefacts, a polite summary. The behaviour you most want to encourage looked exactly like
