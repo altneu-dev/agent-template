@@ -71,7 +71,18 @@ else:
     print(d.get('exit', 0))
 PY
 ) || e=0
-    if [ "$e" != 0 ]; then
+    # 32 is not a failure, and must not be reported as one. An agent that stopped to ask a
+    # human did the thing this harness most wants to encourage — and marking the deployment
+    # unhealthy for it is wrong twice over: platforms gate deployments on health, and some
+    # restart what they consider sick. The correct behaviour would be answered by killing the
+    # container that is waiting for an answer, or by blocking the deploy that carries it.
+    #
+    # It does not become quiet. agent-run says it on stderr, the request sits in
+    # work/escalations/ at 0600, the alert command fires, and `--ready` names it. Health
+    # answers one question only: is this deployment broken.
+    if [ "$e" = 32 ]; then
+      echo "escalated: $(basename "$(dirname "$f")") stopped and asked for a human"
+    elif [ "$e" != 0 ]; then
       echo "unhealthy: $(basename "$(dirname "$f")") last exited $e"
       rc=1
     fi
@@ -220,6 +231,24 @@ if [ "$MODE" = ready ]; then
   The agent does not know who it works for, what is in scope, or what it must never touch."
 
   agent-secret check -q 2>/dev/null || note "not configured: $(agent-secret check 2>&1 | head -3 | tr '\n' ' ')"
+
+  # The only readiness item about the deployment's SURROUNDINGS rather than its contents, which
+  # is exactly why it is the one a fork forgets. An agent that stops to ask a human, in a
+  # deployment where nothing carries the question out, has not asked anyone — and the same is
+  # true of every failed run. Unattended is a promise about who hears, not only about who runs.
+  alert_cmd="$(agent-secret get AGENT_RUN_ALERT_CMD 2>/dev/null || true)"
+  if [ -z "$alert_cmd" ]; then
+    note "no alert path: failures and escalations reach nobody.
+  Set AGENT_RUN_ALERT_CMD — 'agent-alert' ships in this image and needs AGENT_ALERT_WEBHOOK.
+  A host-side command is equally fine; what must not happen is neither."
+  else
+    read -r -a alert_argv <<< "$alert_cmd"
+    if ! command -v "${alert_argv[0]}" >/dev/null 2>&1; then
+      note "alert command not found: ${alert_argv[0]} — failures would reach nobody."
+    elif [ "${alert_argv[0]}" = agent-alert ] && ! agent-alert --check >/dev/null 2>&1; then
+      note "alert path incomplete: $(agent-alert --check 2>&1 | head -1)"
+    fi
+  fi
 
   if [ -n "$(find "${AGENT_APP:-/app}/agent/mcp" -name '*.json' 2>/dev/null)" ]; then
     agent-mcp check >/dev/null 2>&1 || note "MCP definitions do not resolve: run agent-mcp check"

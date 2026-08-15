@@ -660,13 +660,26 @@ with open(sys.argv[1], 'a') as fh:
 PY
 cp "$RUN_DIR/meta.json" "$RUNS/$JOB/last.json" 2>/dev/null
 
+# An alert that fails silently is this harness's own bug, one level up: the mechanism that
+# exists so a human hears about a problem, not saying that it could not tell anyone. The
+# command's output is kept in the run directory so it is attributable afterwards, and a failure
+# is said out loud on stderr — which is where a scheduler's log is looking.
+#
+# Unquoted on purpose: AGENT_RUN_ALERT_CMD may carry arguments, as `verify:` does.
+alert() {
+  [ -n "${AGENT_RUN_ALERT_CMD:-}" ] || return 0
+  $AGENT_RUN_ALERT_CMD "$RUN_DIR" >"$RUN_DIR/alert.log" 2>&1 && return 0
+  echo "agent-run: the alert command failed — nobody has been told about this run." >&2
+  sed -n '1,3p' "$RUN_DIR/alert.log" 2>/dev/null | sed 's/^/  /' >&2
+}
+
 if [ "$STATUS" = 32 ]; then
   # Not a failure, and it must not read like one — an agent that stops rather than guesses is
   # doing the thing context/ asked for. It still alerts, because an escalation nobody sees is
   # the same as no escalation.
   echo "agent-run: '$JOB' escalated and stopped: $(head -1 "$RUN_DIR/escalated")" >&2
   echo "  the request is in $DATA/work/escalations/" >&2
-  [ -n "${AGENT_RUN_ALERT_CMD:-}" ] && $AGENT_RUN_ALERT_CMD "$RUN_DIR" >/dev/null 2>&1
+  alert
 elif [ "$STATUS" != 0 ]; then
   echo "agent-run: '$JOB' failed (exit $STATUS). Details: $RUN_DIR" >&2
   if [ "$STATUS" = 31 ]; then
@@ -675,7 +688,6 @@ elif [ "$STATUS" != 0 ]; then
     echo "  the job claimed to be done, but: $CONTRACT" >&2
   fi
   sed -n '1,5p' "$RUN_DIR/stderr.log" >&2 2>/dev/null
-  # The container has no way to send anything by design, so alerting is the host's job.
-  [ -n "${AGENT_RUN_ALERT_CMD:-}" ] && $AGENT_RUN_ALERT_CMD "$RUN_DIR" >/dev/null 2>&1
+  alert
 fi
 exit "$STATUS"

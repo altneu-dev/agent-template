@@ -108,6 +108,13 @@ that declares the `escalate` tool can stop and ask, which writes a request to
 `work/escalations/`, fires the alert command and exits **`32`**. Before that, "escalated" and
 "silently did nothing" produced identical runs.
 
+Stopping to ask is only worth anything if the asking arrives. `agent-alert` is the sender that
+makes it arrive — a webhook post carrying the job, the exit code and one line of reason, and
+deliberately not the request itself, which quotes the client's own systems. `agent-status
+--ready` fails a deployment whose alert path is missing or names a command that does not exist,
+and a failed send is reported rather than swallowed. An escalation nobody hears is the same
+outcome as no escalation at all, which is why this is checked rather than documented.
+
 ## Observability
 
 Files in the volume, read on demand. No daemon, no port, nothing published.
@@ -167,6 +174,7 @@ ci/universality-test.sh   # installs each example and asserts the framework was 
 | `agent-mcp` | resolves `${VAR}` from secrets into an MCP config, 0600, in tmpfs |
 | `agent-secret` | reads one value from env or file — parsed, never sourced |
 | `agent-status` | what the agent has been doing, changed, and whether it is finished |
+| `agent-alert` | sends one run's outcome to a webhook, so a `31` or a `32` reaches a person |
 | `kb` | the memory: FTS5 over `knowledge/`, `context/` and `work/`, plus a one-line-per-document index |
 
 Notes are append-only, which is what makes concurrent writers safe — but a knowledge base that

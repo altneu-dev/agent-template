@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# agent-alert — send one run's outcome somewhere a human will actually see it.
+#
+#   agent-alert <run-dir>          wired up as AGENT_RUN_ALERT_CMD
+#   agent-alert --check            can this deployment alert at all? costs nothing, sends nothing
+#   agent-alert --test             send one alert now, so "it is configured" becomes "it arrived"
+#
+# WHY THIS IS IN THE IMAGE, when the harness elsewhere says the container sends nothing.
+#
+# That line was aspirational rather than true: the container already reaches a model API over
+# the network, so "it cannot send anything" was never the property. The real property is that
+# nothing reaches IN, and that every effect on a client's system goes through a declared MCP
+# tool and lands in the ledger. An alert is neither — it carries no client data by default and
+# changes nothing outside.
+#
+# What tipped it: an escalation is the behaviour this harness most wants to encourage — an
+# agent that stops rather than guesses — and it was the one outcome that reached nobody unless
+# an operator wrote their own sender. A deploy checklist step that says "prove an alert
+# arrives" needs something to point at in every deployment, not only in a fork that copied an
+# example. Shipping one sender that is careful about payload is a smaller risk than ten forks
+# each writing their own in a hurry.
+#
+# WHAT IT SENDS, and what it deliberately does not. Job name, exit code, run id, and the first
+# line of the reason. Not the escalation request, not the run's stderr, not the artefact —
+# those quote whatever the agent was reading in a client's systems, which is why they are 0600
+# in a volume rather than in anyone's chat history. AGENT_ALERT_VERBOSE=1 opts into the full
+# reason for a deployment whose operators have decided that is fine.
+set -uo pipefail
+
+WEBHOOK="$(agent-secret get AGENT_ALERT_WEBHOOK 2>/dev/null || true)"
+VERBOSE="$(agent-secret get AGENT_ALERT_VERBOSE 2>/dev/null || true)"
+
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --check)
+    if [ -z "$WEBHOOK" ]; then
+      echo "agent-alert: AGENT_ALERT_WEBHOOK is not set — failures and escalations reach nobody." >&2
+      exit 1
+    fi
+    # The scheme is checked, not the host: resolving it would be a network call in a readiness
+    # probe, and a probe that needs the network fails for reasons that have nothing to do with
+    # the deployment.
+    case "$WEBHOOK" in
+      https://*) echo "agent-alert: ready (https webhook configured)"; exit 0 ;;
+      http://*)  echo "agent-alert: webhook is plain http — the payload names a client's job over the wire" >&2
+                 exit 0 ;;
+      *) echo "agent-alert: AGENT_ALERT_WEBHOOK is not a URL: ${WEBHOOK%%:*}..." >&2; exit 1 ;;
+    esac ;;
+esac
+
+[ -n "$WEBHOOK" ] || {
+  echo "agent-alert: AGENT_ALERT_WEBHOOK is not set — nothing was sent." >&2
+  exit 1
+}
+
+if [ "${1:-}" = "--test" ]; then
+  JOB="agent-alert --test"; EXIT_CODE="0"; RUN_ID="test"; REASON="This is a test alert from $(hostname 2>/dev/null || echo agent)."
+else
+  RUN_DIR="${1:?usage: agent-alert <run-dir>}"
+  META="$RUN_DIR/meta.json"
+  [ -f "$META" ] || { echo "agent-alert: no meta.json in $RUN_DIR" >&2; exit 1; }
+  read -r JOB EXIT_CODE RUN_ID < <(python3 - "$META" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get("job", "?"), d.get("exit", "?"), d.get("run_id", "?"))
+PY
+) || { echo "agent-alert: cannot read $META" >&2; exit 1; }
+  # error.txt holds the escalation reason for 32 and the fault for everything else. First line
+  # only unless told otherwise — the rest is the part that quotes the client's data.
+  REASON=""
+  [ -f "$RUN_DIR/error.txt" ] && {
+    if [ "$VERBOSE" = 1 ]; then REASON=$(head -c 1000 "$RUN_DIR/error.txt")
+    else REASON=$(head -1 "$RUN_DIR/error.txt" | cut -c1-200); fi
+  }
+fi
+
+case "$EXIT_CODE" in
+  32) HEADLINE="stopped and asked for a human" ;;
+  31) HEADLINE="claimed to be done, but was not" ;;
+  0)  HEADLINE="test" ;;
+  *)  HEADLINE="failed" ;;
+esac
+
+# Slack and Teams both accept {"text": ...}, and so does almost every generic receiver. A
+# payload shape nobody has to configure is worth more here than a rich one.
+python3 - "$WEBHOOK" "$JOB" "$EXIT_CODE" "$RUN_ID" "$HEADLINE" "$REASON" <<'PY'
+import json, sys, urllib.error, urllib.request
+url, job, code, run, headline, reason = sys.argv[1:7]
+text = f"agent [{job}] {headline} (exit {code}, run {run})"
+if reason:
+    text += f"\n{reason}"
+body = json.dumps({"text": text}).encode()
+req = urllib.request.Request(url, data=body,
+                             headers={"Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        if r.status >= 300:
+            print(f"agent-alert: webhook answered HTTP {r.status}", file=sys.stderr)
+            sys.exit(1)
+except urllib.error.HTTPError as e:
+    print(f"agent-alert: webhook answered HTTP {e.code}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:                       # DNS, TLS, timeout, refused
+    print(f"agent-alert: could not reach the webhook: {e}", file=sys.stderr)
+    sys.exit(1)
+print(f"agent-alert: sent ({headline})")
+PY
