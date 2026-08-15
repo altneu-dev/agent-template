@@ -25,6 +25,10 @@
 #                                  run that actually ended badly.
 #   FAKE_PI_STDERR=<text>          write this to stderr. Log noise is not evidence about the
 #                                  outcome, and agent-run has to stop treating it as such.
+#   FAKE_PI_ENV_DUMP=<path>        write the NAMES of every variable in this process's
+#                                  environment, one per line. Names only, never values: the
+#                                  question a test asks is which secrets reached the model
+#                                  process, and answering it must not write them to disk.
 #   FAKE_PI_EXIT=<n>               exit with this code (default 0 — the real pi exits 0 even
 #                                  when it never reached a model, which is why agent-run
 #                                  judges the stream rather than the exit code)
@@ -76,6 +80,12 @@ if recovered:
         "content": [],
     })
 messages.append(msg)
+
+dump = os.environ.get("FAKE_PI_ENV_DUMP")
+if dump:
+    with open(dump, "w", encoding="utf-8") as fh:
+        for name in sorted(os.environ):
+            fh.write(name + "\n")
 
 noise = os.environ.get("FAKE_PI_STDERR")
 if noise:
