@@ -45,9 +45,12 @@ the mutating ones its own `allow:` deliberately withheld. The propose/commit spl
 being a guarantee the moment either half has a shell.
 
 The harness refuses the nesting: `agent-run` exits `11` when it is called from inside a run.
-That closes the accident and the injected instruction. It does not make `bash` safe — a shell
-still reads every file in the volume, including `/data/.env`, and reaches every network the
-container reaches. Treat one line as the whole security review of a job:
+That closes the *accident* — and only that. The guard is one environment variable, so a shell
+that means to nest can `unset AGENT_RUN_ID` and nest, and there is no way from in here to tell
+an injected instruction from a deliberate one. It does not make `bash` safe in any other sense
+either: a shell reads every file in the volume, including `/data/.env`, inherits the provider
+credential from the process it runs under, and reaches every network the container reaches.
+Treat one line as the whole security review of a job:
 
 ```
 tools: read, write, bash

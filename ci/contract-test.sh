@@ -151,6 +151,22 @@ run 11 "agent-run refuses to start when the caller is itself a run" no-nesting \
 # would also pass the test above.
 run 0 "the same job runs normally when nothing is nesting it" no-nesting
 
+# And the third: the guard's LIMIT, asserted so that it stays true and stays known. The comment
+# above this check used to claim it stopped "the prompt-injected instruction". It does not — it
+# is one environment variable, and a shell that means to nest can unset it. Nothing in here can
+# tell an injected instruction from a deliberate one, because both arrive as the same shell.
+#
+# Pinning the escape hatch looks strange for a test suite, and it is the point: a later change
+# that appeared to close it would be claiming a security property this design does not have,
+# and the honest sentence in jobs/README.md — declaring `bash` is the review — would quietly
+# become wrong. If this assertion ever fails, the docs are what needs rewriting first.
+out=$(env -u AGENT_RUN_ID AGENT_RUN_ID_WAS=deadbeef1234 agent-run no-nesting 2>&1); rc=$?
+if [ "$rc" = 0 ]; then
+  ok "and unsetting the variable defeats it — the escape hatch is one line, as documented"
+else
+  no "the nesting guard now claims more than an env var can deliver (exit $rc): $out"
+fi
+
 # Read-only diagnostics stay usable from inside a run, which is why the guard sits where it
 # does. They cannot start anything, and needing to leave the container to ask what a job
 # declares is how people stop asking.

@@ -76,12 +76,20 @@ in its runtime. A *commit* job declares the mutating tool and `requires:` the pr
 worth more than a confirmation step, because it does not depend on anyone reading the
 confirmation. `examples/helpdesk/` is the worked version.
 
-The ceiling is per job, so the split holds only while a run cannot start another run. It
-cannot: `agent-run` exits `11` when called from inside one. Without that, a job declaring
-`bash` would reach `/app/bin/agent-run`, which is on `PATH` for everything a run spawns and
-re-derives the credential from `/data/.env` on its own — and one shell in one job would hand
-every job's tools to that job. `bash` in a `tools:` line is therefore the whole security review
-of a job; `agent/jobs/README.md` says what it costs.
+The ceiling is per job, so the split holds only while a run cannot start another run.
+`agent-run` exits `11` when called from inside one, which stops it happening by accident — a
+helper script, a copied snippet, a retry loop. Without that, a job declaring `bash` would reach
+`/app/bin/agent-run`, which is on `PATH` for everything a run spawns and re-derives the
+credential from `/data/.env` on its own, and one shell in one job would hand every job's tools
+to that job.
+
+**It does not stop a shell that means to.** The guard is an environment variable, and
+`env -u AGENT_RUN_ID agent-run <other-job>` is one line. Nothing here can distinguish a model
+that was told to type that from a fork author who decided to — both are the same shell. So the
+propose/commit split is a guarantee for jobs *without* a shell, where the mutating tool is
+genuinely absent from the runtime and no arrangement of prompts can conjure it, and it is a
+convention for jobs with one. `bash` in a `tools:` line is the whole security review of a job;
+`agent/jobs/README.md` says what it costs.
 
 ## Proof that the work happened
 
@@ -111,8 +119,9 @@ that declares the `escalate` tool can stop and ask, which writes a request to
 Stopping to ask is only worth anything if the asking arrives. `agent-alert` is the sender that
 makes it arrive — a webhook post carrying the job, the exit code and one line of reason, and
 deliberately not the request itself, which quotes the client's own systems. `agent-status
---ready` fails a deployment whose alert path is missing or names a command that does not exist,
-and a failed send is reported rather than swallowed. An escalation nobody hears is the same
+--ready` fails a deployment whose alert path is missing, names a command that does not exist,
+or still points at the reserved placeholder every fork starts with, and a failed send is
+reported rather than swallowed. An escalation nobody hears is the same
 outcome as no escalation at all, which is why this is checked rather than documented.
 
 ## Observability
@@ -156,8 +165,10 @@ stopped and asked for a human.
 
 Four directories and a variable list. Nothing in `bin/`, `agent/extensions/`, `Dockerfile` or
 `compose.yml` should ever need to change — and `ci/universality-test.sh` fails the build if it
-does. Two worked examples live in `examples/`, deliberately opposite in shape: one is MCP-only
-with no file access at all, the other uses only built-in tools and reaches nothing.
+does. Two worked examples live in `examples/`, deliberately opposite in shape: `digest` uses only
+built-in tools and reaches nothing outside the container, while `helpdesk` reaches a ticket
+system through exactly one allow-listed MCP tool per job. Both write files — the plan a
+*propose* job hands to a *commit* job is a file, so no useful vertical is file-free.
 
 ```bash
 ci/universality-test.sh   # installs each example and asserts the framework was untouched
@@ -212,5 +223,7 @@ to **support@altneu.dev**.
 
 One thing that belongs in mail rather than an issue: anything carrying a client's credentials,
 hostnames or ticket contents. A run directory under `/data/logs/runs/` quotes whatever the
-agent was reading, which is why those files are 0600 — pasting one into a public issue undoes
-that in a way nobody can take back.
+agent was reading, which is why the directory is `0700` — and why `logs/runs.jsonl` and each
+job's `last.json`, which carry the reason a run failed, are worth the same care even though
+they sit outside it. Pasting one into a public issue undoes that in a way nobody can take
+back.

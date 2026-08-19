@@ -215,8 +215,18 @@ claims, and the gap between them is a wrong URL, a revoked webhook, or a firewal
 
 What it sends is deliberately thin: job name, exit code, run id, and the first line of the
 reason. Not the escalation request and not the run's output — those quote whatever the agent
-was reading in the client's systems, which is why they stay 0600 in the volume. If a client
-decides the full reason may leave, `AGENT_ALERT_VERBOSE=1` opts in.
+was reading in the client's systems, which is why they stay in the volume. If a client decides
+the full reason may leave, `AGENT_ALERT_VERBOSE=1` opts in.
+
+Two things to say to the client rather than let them assume:
+
+- **The reason line is written by the agent**, and an agent summarising a ticket may summarise
+  the ticket. One line is a cap on how much leaves, not a promise about what. Where nothing may
+  leave the network, point `AGENT_RUN_ALERT_CMD` at a collector inside it, or leave it unset and
+  use the polling route below.
+- **An alert is a signal to go and look, never a message to act on.** The agent reads content
+  from the client's systems; content can carry instructions; so an alert can arrive in a Teams
+  channel looking like the deployment asking someone to approve something. Read the run.
 
 If the client will not allow outbound traffic at all — a fair position in the environments
 this is built for — leave `AGENT_RUN_ALERT_CMD` unset, say so out loud in the handover, and

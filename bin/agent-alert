@@ -20,11 +20,25 @@
 # example. Shipping one sender that is careful about payload is a smaller risk than ten forks
 # each writing their own in a hurry.
 #
+# WHAT AN ALERT IS NOT. It is a health signal, not a trusted message. The reason line is
+# written by the agent, and an agent reads what a client's systems contain — so a ticket body
+# that carries an injected instruction can put attacker-chosen text into an operator's chat,
+# where it arrives looking like the deployment talking. Two consequences worth stating rather
+# than discovering: the reason is capped at one line and 200 characters because a channel that
+# carries a paragraph of model output is a channel someone will read as instructions, and the
+# right response to an alert is to go and look at the run — never to act on the text itself.
+#
 # WHAT IT SENDS, and what it deliberately does not. Job name, exit code, run id, and the first
 # line of the reason. Not the escalation request, not the run's stderr, not the artefact —
-# those quote whatever the agent was reading in a client's systems, which is why they are 0600
-# in a volume rather than in anyone's chat history. AGENT_ALERT_VERBOSE=1 opts into the full
-# reason for a deployment whose operators have decided that is fine.
+# those quote whatever the agent was reading in a client's systems, which is why they stay in a
+# volume rather than in anyone's chat history. AGENT_ALERT_VERBOSE=1 opts into the full reason
+# for a deployment whose operators have decided that is fine.
+#
+# The reason line is the honest exception, and it is not "no client data": it is free text the
+# agent wrote, and an agent summarising a ticket may summarise the ticket. One line is a cap on
+# how much, not a guarantee of what. A deployment handling material that must not leave should
+# point AGENT_RUN_ALERT_CMD at something inside its own network, or leave it unset and poll
+# agent-status --health instead — DEPLOY.md 7 has both.
 set -uo pipefail
 
 WEBHOOK="$(agent-secret get AGENT_ALERT_WEBHOOK 2>/dev/null || true)"
