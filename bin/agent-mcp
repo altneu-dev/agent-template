@@ -88,6 +88,11 @@ if [ "$MODE" = "off" ]; then
   exit 2
 fi
 
+# Pin the child agent-secret to the same secrets file this command resolved. The two derive
+# the default identically today; naming it means they cannot drift apart later without the
+# line that did it being visible.
+export AGENT_ENV_FILE="$ENV_FILE"
+
 # One python program for every mode. The shell above resolves paths and policy; the JSON
 # merging, ${VAR} expansion and MCP handshake all need real parsing, and bin/kb already
 # established the embedded-python idiom for exactly that reason.
@@ -104,57 +109,45 @@ def warn(m): err.append("agent-mcp: " + m)
 
 # ---------------------------------------------------------------- the secrets file
 #
-# Parsed, never sourced. `set -a; . ~/.env` executes arbitrary shell from a file and puts
-# every secret into this process's environment, and from there into /proc/<pid>/environ of
-# every descendant — including whatever an MCP server subprocess turns out to be. Reading
-# only the variables the definitions actually reference keeps that surface to the minimum.
+# Resolved by agent-secret, not here.
 #
-# The grammar is deliberately boring: KEY=value, optional leading `export`, # comments,
-# blank lines, matching surrounding quotes stripped. No command substitution, no line
-# continuation, no multi-line values.
-ENV_LINE = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$')
-
-def load_env(path):
-    values, source, problems = {}, {}, []
-    try:
-        with open(path, encoding='utf-8', errors='replace') as fh:
-            for n, line in enumerate(fh, 1):
-                if not line.strip() or line.lstrip().startswith('#'):
-                    continue
-                m = ENV_LINE.match(line.rstrip('\n'))
-                if not m:
-                    continue
-                k, v = m.group(1), m.group(2)
-                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
-                    v = v[1:-1]                       # quoted: literal, '#' included
-                elif v[:1] in ('"', "'"):
-                    # An unmatched quote means the value continues on the next line, which
-                    # this parser does not support. Silently taking the first line would
-                    # hand a truncated credential to a server and produce an auth error
-                    # nobody could trace back to here.
-                    problems.append(f"{os.path.basename(path)}:{n}: {k} looks like a "
-                                    f"multi-line value — not supported; put it on one line")
-                    continue
-                else:
-                    # Unquoted: a trailing comment is not part of the value. Requires
-                    # whitespace before '#', so a value containing '#' survives.
-                    v = re.sub(r'\s+#.*$', '', v).rstrip()
-                values[k], source[k] = v, 'secrets file'
-    except FileNotFoundError:
-        return values, source, problems, False
-    except OSError as e:
-        problems.append(f"cannot read {path}: {e}")
-        return values, source, problems, False
-    return values, source, problems, True
-
-env_values, env_source, env_problems, env_present = load_env(env_file)
+# This file used to carry its own copy of the KEY=value grammar and its own idea of where a
+# value may come from, and both had drifted from agent-secret's. Two divergences, each one a
+# deployment that fails for a reason the documentation denies:
+#
+#   * AGENT_ENV was invisible here. It is the ONLY route a platform gives a vertical for its
+#     own variables — compose.yml is frozen, so it cannot name them — and DEPLOY.md §2 says to
+#     use it. A deployer who followed that got `agent-mcp check` reporting the variable
+#     missing, and every scheduled run exiting 10, while `agent-secret get` printed it happily.
+#   * The order was inverted: the secrets file won over the environment here and lost to it
+#     there, so one deployment could answer the same question two ways.
+#
+# Shelling out costs two subprocesses per referenced variable — a handful, once, at render
+# time — and buys the guarantee that what MCP servers receive and what the model process
+# receives came from the same place by the same rules. `agent-secret` is on PATH in the image
+# and in every test harness.
+resolved = {}
 
 def lookup(name):
-    if name in env_values:
-        return env_values[name], env_source[name]
-    if name in os.environ:              # so ${AGENT_PROJECT} and friends resolve at all
-        return os.environ[name], 'env'
-    return None, None
+    if name in resolved:
+        return resolved[name]
+    got = subprocess.run(['agent-secret', 'get', name], capture_output=True, text=True)
+    # agent-secret refuses some inputs by name — a multi-line value, most importantly, which
+    # would otherwise hand a server a truncated credential. Carry its reasoning up rather than
+    # reporting a bare "missing", which would send the operator looking in the wrong place.
+    for line in got.stderr.splitlines():
+        line = line.strip()
+        if line and not line.endswith('is not set'):
+            env_problems.append(line)
+    if got.returncode != 0:
+        resolved[name] = (None, None)
+    else:
+        src = subprocess.run(['agent-secret', 'source', name], capture_output=True, text=True)
+        resolved[name] = (got.stdout, src.stdout.strip() or 'set')
+    return resolved[name]
+
+env_problems = []
+env_present = os.path.exists(env_file)
 
 # ---------------------------------------------------------------- merge the definitions
 #
@@ -287,7 +280,13 @@ if missing:
             for m in err: print(m, file=sys.stderr)
             sys.exit(2)
     elif cmd != 'print':
-        whence = '~/.env' if env_present else f'{env_file} (the secrets file is not mounted)'
+        # Reasons before the list. A name can be missing because nothing set it, or because
+        # agent-secret refused what was set — a multi-line value, say. Reporting only "not
+        # in the secrets file" for the second case sends the operator to add a variable that
+        # is already there.
+        for m in env_problems:
+            print("agent-mcp: " + m, file=sys.stderr)
+        whence = env_file if env_present else f'{env_file} (not mounted), the environment or AGENT_ENV'
         print(f"missing (referenced in {mcp_dir}, not in {whence}):", file=sys.stderr)
         for name, wheres in sorted(by_name.items()):
             srv = server_of(wheres[0])

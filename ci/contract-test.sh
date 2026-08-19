@@ -398,6 +398,82 @@ perm=$(stat -c %a "$(ls "$WORK/data/work/escalations"/*.json | head -1)")
   && ok "the request is 0600 — it quotes whatever the agent was looking at" \
   || no "the escalation file is mode $perm, expected 600"
 
+# ---------------------------------------------------------------- one grammar for KEY=value
+#
+# The secrets file and the AGENT_ENV blob are the same grammar, and agent-mcp resolves through
+# the same command, so there is one answer to "what is this variable". There used to be three
+# implementations and they disagreed about a truncated credential.
+echo
+echo "== a value this deployment cannot read is refused, not truncated =="
+
+SEC="$WORK/data/.env"
+cp "$SEC" "$SEC.bak"
+printf 'ANTHROPIC_API_KEY="sk-ant-first\nsecond"\n' > "$SEC"
+
+out=$(agent-secret get ANTHROPIC_API_KEY 2>&1); rc=$?
+if [ "$rc" != 0 ]; then
+  ok "a multi-line value is refused rather than resolved"
+else
+  no "agent-secret returned something for a multi-line value: [$out]"
+fi
+# The specific danger: returning the first line hands over a key that is almost right, which
+# fails as a 401 the classifier files as "do not retry" — pointing at the provider, not here.
+case "$out" in
+  *sk-ant-first*) no "the FIRST LINE of a multi-line secret was handed back — truncated credential" ;;
+  *multi-line*)   ok "and says which file and line, so the paste can be found" ;;
+  *)              no "refused, but said nothing useful: [$out]" ;;
+esac
+
+# Same input, same grammar, through the other door.
+out=$(AGENT_ENV="$(printf 'SOME_TOKEN="tok-first\nsecond')" agent-secret get SOME_TOKEN 2>&1)
+case "$out" in
+  *tok-first*) no "AGENT_ENV still truncates where the secrets file no longer does" ;;
+  *)           ok "AGENT_ENV refuses it too — one grammar, not two" ;;
+esac
+
+cp "$SEC.bak" "$SEC"
+
+# Values that are merely awkward must still resolve, or this refusal is just a new outage.
+printf 'A="quoted #keep"\nB=plain   # note\nC=pass#word\n' >> "$SEC"
+[ "$(agent-secret get A)" = 'quoted #keep' ] && ok "a quoted value keeps its '#'" || no "quoted value mangled"
+[ "$(agent-secret get B)" = 'plain' ]        && ok "a trailing comment is not part of the value" || no "trailing comment kept"
+[ "$(agent-secret get C)" = 'pass#word' ]    && ok "a '#' inside a value survives" || no "value containing # was truncated"
+cp "$SEC.bak" "$SEC"
+
+echo
+echo "== the documented route for a vertical's MCP variables actually reaches agent-mcp =="
+
+# DEPLOY.md 2: compose.yml is frozen, so AGENT_ENV is the only way a platform can pass a
+# vertical's own variables. agent-mcp used to be unable to see them, so a deployment that
+# followed the documentation exactly failed preflight and exited 10 on every scheduled run.
+mkdir -p "$WORK/agent/mcp"
+cat > "$WORK/agent/mcp/probe.json" <<'JSON'
+{"mcpServers":{"probe":{"command":"node","args":["/app/x.js"],"env":{"TOKEN":"${PROBE_TOKEN}"}}}}
+JSON
+
+agent-mcp check >/dev/null 2>&1 \
+  && no "agent-mcp passed with PROBE_TOKEN set nowhere" \
+  || ok "an unset variable still fails preflight"
+
+AGENT_ENV='PROBE_TOKEN=tok-123' agent-mcp check >/dev/null 2>&1 \
+  && ok "a variable delivered through AGENT_ENV resolves — the documented route works" \
+  || no "AGENT_ENV is invisible to agent-mcp: DEPLOY 2's route exits 10 on every run"
+
+src=$(AGENT_ENV='PROBE_TOKEN=tok-123' agent-mcp check 2>&1 | sed -n 's/.*PROBE_TOKEN *//p')
+[ "$src" = "AGENT_ENV" ] \
+  && ok "and it names AGENT_ENV as the source, not a guess" \
+  || no "source reported as '$src'"
+
+# agent-mcp must not have its own idea of the grammar either.
+printf 'PROBE_TOKEN="tok-first\nsecond"\n' > "$SEC"
+out=$(agent-mcp check 2>&1)
+case "$out" in
+  *multi-line*) ok "agent-mcp reports agent-secret's reason instead of a bare 'missing'" ;;
+  *)            no "agent-mcp lost the reason a present variable was rejected: [$out]" ;;
+esac
+cp "$SEC.bak" "$SEC"
+rm -f "$WORK/agent/mcp/probe.json"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
