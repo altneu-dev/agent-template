@@ -39,9 +39,28 @@ case "${1:-}" in
       echo "agent-alert: AGENT_ALERT_WEBHOOK is not set — failures and escalations reach nobody." >&2
       exit 1
     fi
+    # A host that CANNOT resolve, by reservation rather than by accident, is not a webhook —
+    # it is the placeholder still sitting where a real URL belongs. Both shipped examples set
+    # example.invalid deliberately, so that a fork which has not been finished cannot quietly
+    # send a client's job names anywhere; the cost was that `--check` called it ready and
+    # `--ready` agreed, which made the one mistake this command exists to catch — nobody ever
+    # pointed the webhook at anything — the single mistake it could not see. RFC 2606 and 6761
+    # reserve these names precisely so that software may treat them as never-real.
+    #
+    # localhost is NOT in this list: a sidecar collector on the loopback interface is unusual
+    # but legitimate, and refusing it would be this check inventing a policy.
+    host="${WEBHOOK#*://}"; host="${host%%/*}"; host="${host%%:*}"; host="${host%%@*}"
+    case "$host" in
+      *.invalid|*.test|*.example|example.com|example.net|example.org)
+        echo "agent-alert: AGENT_ALERT_WEBHOOK is still $host — a reserved name that can never" >&2
+        echo "  resolve, which means it is the placeholder, not a webhook. Failures and" >&2
+        echo "  escalations reach nobody. Replace it, then prove it: agent-alert --test" >&2
+        exit 1 ;;
+    esac
+
     # The scheme is checked, not the host: resolving it would be a network call in a readiness
     # probe, and a probe that needs the network fails for reasons that have nothing to do with
-    # the deployment.
+    # the deployment. Reservation is a property of the NAME, so checking it costs no network.
     case "$WEBHOOK" in
       https://*) echo "agent-alert: ready (https webhook configured)"; exit 0 ;;
       http://*)  echo "agent-alert: webhook is plain http — the payload names a client's job over the wire" >&2

@@ -352,7 +352,7 @@ if AGENT_ALERT_WEBHOOK= agent-alert --check >/dev/null 2>&1; then
 else
   ok "no webhook configured is not ready"
 fi
-if AGENT_ALERT_WEBHOOK=https://example.invalid/hook agent-alert --check >/dev/null 2>&1; then
+if AGENT_ALERT_WEBHOOK=https://hooks.example-corp.de/hook agent-alert --check >/dev/null 2>&1; then
   ok "an https webhook is"
 else
   no "a configured https webhook was rejected"
@@ -473,6 +473,58 @@ case "$out" in
 esac
 cp "$SEC.bak" "$SEC"
 rm -f "$WORK/agent/mcp/probe.json"
+
+echo
+echo "== a webhook that can never resolve is not a webhook =="
+
+# Both examples ship example.invalid on purpose: a fork that has not been finished must not be
+# able to send a client's job names anywhere. The cost was that --check called it ready, so the
+# single mistake this whole path exists to catch — nobody ever replaced the placeholder — was
+# the one mistake it could not see. Reserved names (RFC 2606/6761) are never-real by
+# definition, which is a property of the NAME and so costs no network call to check.
+AGENT_ALERT_WEBHOOK=https://example.invalid/replace-me agent-alert --check >/dev/null 2>&1 \
+  && no "the shipped placeholder webhook passed --check" \
+  || ok "the placeholder webhook is refused"
+
+out=$(AGENT_ALERT_WEBHOOK=https://example.invalid/replace-me agent-alert --check 2>&1)
+case "$out" in
+  *example.invalid*) ok "and names the host, so it is obvious what to replace" ;;
+  *)                 no "refused without saying what was wrong: [$out]" ;;
+esac
+
+# The refusal must be about reservation, not about the string "example" appearing somewhere.
+AGENT_ALERT_WEBHOOK=https://hooks.example-corp.de/services/x agent-alert --check >/dev/null 2>&1 \
+  && ok "a real host that merely contains 'example' still passes" \
+  || no "a legitimate webhook was refused"
+
+# --ready is where a deployer meets this, so assert it there too rather than trusting delegation.
+ready=$(AGENT_RUN_ALERT_CMD=agent-alert AGENT_ALERT_WEBHOOK=https://example.invalid/x \
+        agent-status --ready 2>&1)
+case "$ready" in
+  *example.invalid*) ok "--ready refuses to call a fork finished while the placeholder stands" ;;
+  *)                 no "--ready passed a deployment whose webhook can never resolve" ;;
+esac
+
+echo
+echo "== the alert fires where the documentation says it fires =="
+
+# .env.example used to say "whenever a run exits non-zero". It cannot: a preflight refusal
+# happens before there is a run directory to hand over. Worth pinning, because the wrong belief
+# is the dangerous one — an operator who thinks a broken deployment will alert them will not
+# watch the scheduler, which is the only thing that can see a 10.
+cat > "$WORK/bin/alert-count" <<SH
+#!/bin/sh
+echo x >> "$WORK/alert-calls"
+SH
+chmod +x "$WORK/bin/alert-count"
+rm -f "$WORK/alert-calls"
+
+AGENT_RUN_ALERT_CMD=alert-count agent-run no-such-job-at-all >/dev/null 2>&1
+rc=$?
+[ "$rc" = 10 ] && ok "an unknown job is a preflight refusal (exit 10)" || no "expected 10, got $rc"
+[ -f "$WORK/alert-calls" ] \
+  && no "the alert fired for a preflight refusal, which has no run directory to report" \
+  || ok "and it sends no alert — the scheduler is what sees a 10, as DEPLOY 8 says"
 
 echo
 echo "$pass passed, $fail failed"

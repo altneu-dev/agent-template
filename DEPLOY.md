@@ -219,10 +219,19 @@ was reading in the client's systems, which is why they stay 0600 in the volume. 
 decides the full reason may leave, `AGENT_ALERT_VERBOSE=1` opts in.
 
 If the client will not allow outbound traffic at all — a fair position in the environments
-this is built for — leave `AGENT_RUN_ALERT_CMD` unset and say so out loud in the handover.
-`agent-status --health` still reports failures and escalations to a monitoring system that
-polls from outside, and that is then the agreed path. What must not happen is a deployment
-that everyone assumes is alerting and is not.
+this is built for — leave `AGENT_RUN_ALERT_CMD` unset, say so out loud in the handover, and
+agree what polls instead. Be precise about what a poller sees, because the exit code alone is
+not enough:
+
+```bash
+agent-status --health          # exit 1 on a FAILING job. Exit 0 with an escalation pending.
+agent-status --health | grep '^escalated:'    # the line that carries the question
+```
+
+That asymmetry is deliberate — a deliberate stop must not make a service undeployable, and
+platforms gate deploys on health — but it means a monitor wired only to the exit code will
+never see an escalation. It has to read the output. What must not happen is a deployment that
+everyone assumes is alerting and is not.
 
 ## 8. Running jobs on a schedule
 

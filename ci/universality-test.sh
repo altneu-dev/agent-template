@@ -25,11 +25,19 @@ ok()   { pass=$((pass+1)); printf '  PASS  %s\n' "$1"; }
 no()   { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 
 # Everything a vertical must never need to change.
-FRAMEWORK=(
-  bin/agent-init bin/agent-run bin/agent-mcp bin/agent-secret bin/agent-status
-  bin/agent-entrypoint bin/kb agent/extensions/mcp-tools.ts agent/AGENTS.md
-  Dockerfile compose.yml package.json
-)
+#
+# DERIVED from the repository, not typed out. It was a hand-maintained list, and a list is a
+# second copy of "what is the framework" that someone has to remember to update. Nobody did:
+# the commit that added bin/agent-alert — a framework file, carrying the property that an
+# escalation reaches a human — did not add it here, so the gate that exists to protect
+# framework files quietly stopped protecting the newest one. agent/extensions/escalate.ts had
+# been unprotected for longer. A glob cannot be forgotten.
+#
+# Read from $REPO and then used for BOTH fingerprints, rather than re-globbed per example: a
+# vertical is allowed to ADD scripts to bin/ (the helpdesk example ships its own), and globbing
+# the installed tree would fingerprint those and fail every example for growing.
+mapfile -t FRAMEWORK < <(cd "$REPO" && ls bin/* agent/extensions/*.ts 2>/dev/null)
+FRAMEWORK+=(agent/AGENTS.md Dockerfile compose.yml package.json)
 
 fingerprint() {
   local root="$1" f
@@ -39,6 +47,27 @@ fingerprint() {
 }
 
 BASE_FP="$(fingerprint "$REPO")"
+
+# The gate is only worth what it covers, and it silently covered less than it claimed: two
+# framework files were absent from the list this replaced. Assert membership and assert
+# detection, because "the glob is right" and "tampering is caught" are different claims.
+echo
+echo "== the framework freeze covers the framework =="
+for must in bin/agent-run bin/agent-alert bin/agent-secret agent/extensions/escalate.ts \
+            agent/extensions/mcp-tools.ts compose.yml; do
+  case " ${FRAMEWORK[*]} " in
+    *" $must "*) ok "frozen: $must" ;;
+    *)           no "$must is NOT frozen — a vertical could replace it and CI would pass" ;;
+  esac
+done
+
+tamper="$(mktemp -d)"
+cp -r "$REPO"/{bin,agent,Dockerfile,compose.yml,package.json} "$tamper/" 2>/dev/null
+printf '\n# a vertical was here\n' >> "$tamper/bin/agent-alert"
+[ "$(fingerprint "$tamper")" != "$BASE_FP" ] \
+  && ok "and an edit to one of them is actually detected" \
+  || no "bin/agent-alert was edited and the fingerprint did not move"
+rm -rf "$tamper"
 
 for example in "$REPO"/examples/*/; do
   name="$(basename "$example")"
@@ -83,9 +112,29 @@ for example in "$REPO"/examples/*/; do
   # An example is a worked fork, so it must satisfy the same readiness gate a client deployment
   # does — jobs present, context written, every job actually buildable. If an example cannot
   # pass this, the gate is asking forks for something the framework's own examples do not do.
-  agent-status --ready >/dev/null 2>&1 && ok "the fork is complete (agent-status --ready)" \
-                                       || { no "agent-status --ready fails for this example"
-                                            agent-status --ready 2>&1 | sed 's/^/        /'; }
+  # An example is a finished VERTICAL and an unfinished DEPLOYMENT, and --ready is right to
+  # say so: both examples ship example.invalid as the webhook, because a placeholder that can
+  # never resolve is the only safe default, and a deployment whose escalations reach nobody is
+  # not ready. So the assertion is not "clean" — it is "the alert path is the ONLY thing
+  # outstanding". That is a stronger claim than the one it replaces, which passed while the
+  # webhook pointed nowhere, and would have gone on passing if the vertical were missing its
+  # context, its jobs, or a skill it names.
+  ready_out="$(agent-status --ready 2>&1)"
+  # --ready prints its own tally; parsing that rather than counting lines keeps this
+  # assertion from breaking every time a note gains a line of explanation.
+  ready_gaps="$(printf '%s\n' "$ready_out" | sed -n 's/^\([0-9]\+\) thing(s) to finish.*/\1/p')"
+  case "$ready_out" in
+    *"still example.invalid"*|*"alert path incomplete"*)
+      if [ "$ready_gaps" = 1 ]; then
+        ok "the vertical is complete; the only gap is the webhook nobody has set yet"
+      else
+        no "the example has $ready_gaps unfinished items, expected only the webhook"
+        printf '%s\n' "$ready_out" | sed 's/^/        /'
+      fi ;;
+    *)
+      no "agent-status --ready did not flag the placeholder webhook"
+      printf '%s\n' "$ready_out" | sed 's/^/        /' ;;
+  esac
 
   # AGENTS.md instructs the agent to use kb. A documented command that does not exist is the
   # exact failure this repo was written to stop repeating, so it is asserted rather than assumed.
