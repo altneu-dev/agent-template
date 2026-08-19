@@ -8,6 +8,16 @@
 #   agent-mcp tools [name..]  <server>__<tool> per line — what a job may put in `allow:`
 #   agent-mcp render          write the expanded config, print its path (used by agent-run)
 #
+# AGENT_MCP=optional  drop a server whose variables are missing, instead of refusing
+# AGENT_MCP=off       skip MCP entirely
+#
+# Those two were readable nowhere but in this file's own error output, which is a poor place to
+# advertise a switch you reach for when things are already broken. They are deliberately NOT in
+# compose.yml or .env.example: a platform passes only what compose names, so putting them there
+# would make "run with some servers silently dropped" a deployment-time setting. It should be a
+# decision someone makes in a terminal, in front of the failure, and not one that survives into
+# the next deploy.
+#
 # Why this exists: mcp/ was documented as an extension point long before anything read it.
 # A fork could ship definitions, follow the documentation exactly, and get an agent with no
 # MCP tools and no error message.
@@ -38,14 +48,18 @@ TEMPLATE_MCP="$APP_DIR/agent/mcp"
 MODE="${AGENT_MCP:-on}"          # on | optional | off
 
 usage() {
-  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# Where the definitions live. The volume comes first: mcp/ is a template extension point,
-# so it is per-instance and editable, which is the whole reason it is seeded rather than
-# read from the image. The image path is a fallback for volumes seeded before this
-# directory existed — those need `agent-upgrade`, and we say so rather than silently
-# using a copy the operator cannot edit.
+# Where the definitions live. $DATA/mcp is a SYMLINK into /app/agent/mcp, made by agent-init
+# — the definitions ship with the deployment and are replaced on every deploy, like the rest
+# of /app. (This comment used to say mcp/ was "seeded" into the volume and editable there, and
+# pointed at an `agent-upgrade` command to convert an old volume. Neither has been true for a
+# while: nothing in this repo seeds mcp/, and no such command exists.)
+#
+# The image path stays as a fallback for the one case that still happens: agent-mcp run by hand
+# on a volume where agent-init has not run yet, so the symlink is not there. The content is
+# identical, so there is nothing to warn about.
 MCP_DIR="${AGENT_MCP_DIR:-}"
 FELL_BACK=0
 if [ -z "$MCP_DIR" ]; then
@@ -293,9 +307,19 @@ if missing:
             src = os.path.basename(origin[srv]) if srv in origin else '?'
             print(f"  {name:<24} ({src} → {wheres[0]})", file=sys.stderr)
         print("", file=sys.stderr)
-        print("Fix on the host in /opt/secrets/<project>.env, then: docker restart proj-<project>",
+        # This used to name /opt/secrets/<project>.env and `docker restart proj-<project>` —
+        # one developer's own host layout, documented nowhere in this repo, and the first
+        # thing a fork saw when its MCP configuration was wrong.
+        print("Set it where this deployment reads configuration, then redeploy:", file=sys.stderr)
+        print("  - the platform's variable UI (a vertical's own variables go in AGENT_ENV)",
               file=sys.stderr)
-        print("Or: AGENT_MCP=optional (drop that server) / AGENT_MCP=off (skip MCP entirely)",
+        print("  - or /data/.env, for a client who wants credentials only on their own disk",
+              file=sys.stderr)
+        print("  DEPLOY.md 2 has both, and `agent-secret source <NAME>` says which one answered.",
+              file=sys.stderr)
+        print("Or skip MCP: AGENT_MCP=optional drops the server that is missing a variable,",
+              file=sys.stderr)
+        print("AGENT_MCP=off skips MCP entirely. Both are terminal switches, not deploy config.",
               file=sys.stderr)
         sys.exit(1)
 
@@ -314,8 +338,8 @@ if cmd == 'print':
 
 if cmd == 'check':
     if fell_back:
-        say(f"using {mcp_dir} from the image — this volume has no ~/mcp/.")
-        say("  Run `agent-upgrade` to get an editable copy in the volume.")
+        say(f"reading definitions from {mcp_dir} — /data/mcp is not linked yet (agent-init "
+            "makes that link). Same files either way.")
         say("")
     say(f"{len(files)} file(s), {len(expanded)} server(s): " + ", ".join(sorted(expanded)))
     if used:
