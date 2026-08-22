@@ -151,6 +151,22 @@ run 11 "agent-run refuses to start when the caller is itself a run" no-nesting \
 # would also pass the test above.
 run 0 "the same job runs normally when nothing is nesting it" no-nesting
 
+# And the third: the guard's LIMIT, asserted so that it stays true and stays known. The comment
+# above this check used to claim it stopped "the prompt-injected instruction". It does not — it
+# is one environment variable, and a shell that means to nest can unset it. Nothing in here can
+# tell an injected instruction from a deliberate one, because both arrive as the same shell.
+#
+# Pinning the escape hatch looks strange for a test suite, and it is the point: a later change
+# that appeared to close it would be claiming a security property this design does not have,
+# and the honest sentence in jobs/README.md — declaring `bash` is the review — would quietly
+# become wrong. If this assertion ever fails, the docs are what needs rewriting first.
+out=$(env -u AGENT_RUN_ID AGENT_RUN_ID_WAS=deadbeef1234 agent-run no-nesting 2>&1); rc=$?
+if [ "$rc" = 0 ]; then
+  ok "and unsetting the variable defeats it — the escape hatch is one line, as documented"
+else
+  no "the nesting guard now claims more than an env var can deliver (exit $rc): $out"
+fi
+
 # Read-only diagnostics stay usable from inside a run, which is why the guard sits where it
 # does. They cannot start anything, and needing to leave the container to ask what a job
 # declares is how people stop asking.
@@ -352,7 +368,7 @@ if AGENT_ALERT_WEBHOOK= agent-alert --check >/dev/null 2>&1; then
 else
   ok "no webhook configured is not ready"
 fi
-if AGENT_ALERT_WEBHOOK=https://example.invalid/hook agent-alert --check >/dev/null 2>&1; then
+if AGENT_ALERT_WEBHOOK=https://hooks.example-corp.de/hook agent-alert --check >/dev/null 2>&1; then
   ok "an https webhook is"
 else
   no "a configured https webhook was rejected"
@@ -397,6 +413,134 @@ perm=$(stat -c %a "$(ls "$WORK/data/work/escalations"/*.json | head -1)")
 [ "$perm" = 600 ] \
   && ok "the request is 0600 — it quotes whatever the agent was looking at" \
   || no "the escalation file is mode $perm, expected 600"
+
+# ---------------------------------------------------------------- one grammar for KEY=value
+#
+# The secrets file and the AGENT_ENV blob are the same grammar, and agent-mcp resolves through
+# the same command, so there is one answer to "what is this variable". There used to be three
+# implementations and they disagreed about a truncated credential.
+echo
+echo "== a value this deployment cannot read is refused, not truncated =="
+
+SEC="$WORK/data/.env"
+cp "$SEC" "$SEC.bak"
+printf 'ANTHROPIC_API_KEY="sk-ant-first\nsecond"\n' > "$SEC"
+
+out=$(agent-secret get ANTHROPIC_API_KEY 2>&1); rc=$?
+if [ "$rc" != 0 ]; then
+  ok "a multi-line value is refused rather than resolved"
+else
+  no "agent-secret returned something for a multi-line value: [$out]"
+fi
+# The specific danger: returning the first line hands over a key that is almost right, which
+# fails as a 401 the classifier files as "do not retry" — pointing at the provider, not here.
+case "$out" in
+  *sk-ant-first*) no "the FIRST LINE of a multi-line secret was handed back — truncated credential" ;;
+  *multi-line*)   ok "and says which file and line, so the paste can be found" ;;
+  *)              no "refused, but said nothing useful: [$out]" ;;
+esac
+
+# Same input, same grammar, through the other door.
+out=$(AGENT_ENV="$(printf 'SOME_TOKEN="tok-first\nsecond')" agent-secret get SOME_TOKEN 2>&1)
+case "$out" in
+  *tok-first*) no "AGENT_ENV still truncates where the secrets file no longer does" ;;
+  *)           ok "AGENT_ENV refuses it too — one grammar, not two" ;;
+esac
+
+cp "$SEC.bak" "$SEC"
+
+# Values that are merely awkward must still resolve, or this refusal is just a new outage.
+printf 'A="quoted #keep"\nB=plain   # note\nC=pass#word\n' >> "$SEC"
+[ "$(agent-secret get A)" = 'quoted #keep' ] && ok "a quoted value keeps its '#'" || no "quoted value mangled"
+[ "$(agent-secret get B)" = 'plain' ]        && ok "a trailing comment is not part of the value" || no "trailing comment kept"
+[ "$(agent-secret get C)" = 'pass#word' ]    && ok "a '#' inside a value survives" || no "value containing # was truncated"
+cp "$SEC.bak" "$SEC"
+
+echo
+echo "== the documented route for a vertical's MCP variables actually reaches agent-mcp =="
+
+# DEPLOY.md 2: compose.yml is frozen, so AGENT_ENV is the only way a platform can pass a
+# vertical's own variables. agent-mcp used to be unable to see them, so a deployment that
+# followed the documentation exactly failed preflight and exited 10 on every scheduled run.
+mkdir -p "$WORK/agent/mcp"
+cat > "$WORK/agent/mcp/probe.json" <<'JSON'
+{"mcpServers":{"probe":{"command":"node","args":["/app/x.js"],"env":{"TOKEN":"${PROBE_TOKEN}"}}}}
+JSON
+
+agent-mcp check >/dev/null 2>&1 \
+  && no "agent-mcp passed with PROBE_TOKEN set nowhere" \
+  || ok "an unset variable still fails preflight"
+
+AGENT_ENV='PROBE_TOKEN=tok-123' agent-mcp check >/dev/null 2>&1 \
+  && ok "a variable delivered through AGENT_ENV resolves — the documented route works" \
+  || no "AGENT_ENV is invisible to agent-mcp: DEPLOY 2's route exits 10 on every run"
+
+src=$(AGENT_ENV='PROBE_TOKEN=tok-123' agent-mcp check 2>&1 | sed -n 's/.*PROBE_TOKEN *//p')
+[ "$src" = "AGENT_ENV" ] \
+  && ok "and it names AGENT_ENV as the source, not a guess" \
+  || no "source reported as '$src'"
+
+# agent-mcp must not have its own idea of the grammar either.
+printf 'PROBE_TOKEN="tok-first\nsecond"\n' > "$SEC"
+out=$(agent-mcp check 2>&1)
+case "$out" in
+  *multi-line*) ok "agent-mcp reports agent-secret's reason instead of a bare 'missing'" ;;
+  *)            no "agent-mcp lost the reason a present variable was rejected: [$out]" ;;
+esac
+cp "$SEC.bak" "$SEC"
+rm -f "$WORK/agent/mcp/probe.json"
+
+echo
+echo "== a webhook that can never resolve is not a webhook =="
+
+# Both examples ship example.invalid on purpose: a fork that has not been finished must not be
+# able to send a client's job names anywhere. The cost was that --check called it ready, so the
+# single mistake this whole path exists to catch — nobody ever replaced the placeholder — was
+# the one mistake it could not see. Reserved names (RFC 2606/6761) are never-real by
+# definition, which is a property of the NAME and so costs no network call to check.
+AGENT_ALERT_WEBHOOK=https://example.invalid/replace-me agent-alert --check >/dev/null 2>&1 \
+  && no "the shipped placeholder webhook passed --check" \
+  || ok "the placeholder webhook is refused"
+
+out=$(AGENT_ALERT_WEBHOOK=https://example.invalid/replace-me agent-alert --check 2>&1)
+case "$out" in
+  *example.invalid*) ok "and names the host, so it is obvious what to replace" ;;
+  *)                 no "refused without saying what was wrong: [$out]" ;;
+esac
+
+# The refusal must be about reservation, not about the string "example" appearing somewhere.
+AGENT_ALERT_WEBHOOK=https://hooks.example-corp.de/services/x agent-alert --check >/dev/null 2>&1 \
+  && ok "a real host that merely contains 'example' still passes" \
+  || no "a legitimate webhook was refused"
+
+# --ready is where a deployer meets this, so assert it there too rather than trusting delegation.
+ready=$(AGENT_RUN_ALERT_CMD=agent-alert AGENT_ALERT_WEBHOOK=https://example.invalid/x \
+        agent-status --ready 2>&1)
+case "$ready" in
+  *example.invalid*) ok "--ready refuses to call a fork finished while the placeholder stands" ;;
+  *)                 no "--ready passed a deployment whose webhook can never resolve" ;;
+esac
+
+echo
+echo "== the alert fires where the documentation says it fires =="
+
+# .env.example used to say "whenever a run exits non-zero". It cannot: a preflight refusal
+# happens before there is a run directory to hand over. Worth pinning, because the wrong belief
+# is the dangerous one — an operator who thinks a broken deployment will alert them will not
+# watch the scheduler, which is the only thing that can see a 10.
+cat > "$WORK/bin/alert-count" <<SH
+#!/bin/sh
+echo x >> "$WORK/alert-calls"
+SH
+chmod +x "$WORK/bin/alert-count"
+rm -f "$WORK/alert-calls"
+
+AGENT_RUN_ALERT_CMD=alert-count agent-run no-such-job-at-all >/dev/null 2>&1
+rc=$?
+[ "$rc" = 10 ] && ok "an unknown job is a preflight refusal (exit 10)" || no "expected 10, got $rc"
+[ -f "$WORK/alert-calls" ] \
+  && no "the alert fired for a preflight refusal, which has no run directory to report" \
+  || ok "and it sends no alert — the scheduler is what sees a 10, as DEPLOY 8 says"
 
 echo
 echo "$pass passed, $fail failed"

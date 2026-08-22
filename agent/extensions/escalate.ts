@@ -80,10 +80,15 @@ export default async function (pi: any) {
         }
       }
 
+      // What this says to the model is a claim about the world, so it has to be one this
+      // extension can actually make. "A human has been notified" was not: notifying happens
+      // in agent-run, after this returns, and only if the deployment has an alert path that
+      // works. In a deployment with none it was simply false — and a model told its question
+      // has reached someone has no reason to phrase it as if it might not have.
       return {
         content: [{
           type: "text",
-          text: "Escalated. A human has been notified and this run is over. " +
+          text: "Escalated. The request has been recorded for a human and this run is over. " +
                 "Do not attempt the task another way, and do not continue: stop here.",
         }],
       };

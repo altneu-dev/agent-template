@@ -332,13 +332,21 @@ fi
 # Checked at this point, and not earlier, so that --list, --dry-run and --probe-tools keep
 # working from inside a run. They read; they cannot start anything.
 #
-# What this does NOT do, stated plainly because a control whose limits are unclear gets
-# trusted for more than it does: a job author who wants nesting can `unset AGENT_RUN_ID` and
-# have it. This stops the accident and the prompt-injected instruction — the model does not
-# get to widen its own surface by calling another job — not a fork that has decided otherwise.
-# That is deliberate: an escape hatch nobody can find would only be worked around in a way
-# nobody can see. Blessing one with a flag would turn the decision into a checkbox ticked in
-# the same commit as the risky line.
+# WHAT THIS DOES NOT DO. An earlier version of this comment said the guard stops "the
+# accident and the prompt-injected instruction". Only the first half is true, and the
+# distinction it drew does not exist: the guard is one environment variable, `env -u
+# AGENT_RUN_ID agent-run <other-job>` defeats it, and a model that has been told to type that
+# line is using the same shell as a job author who decided to. There is no mechanism here that
+# can tell those two apart, because there is no mechanism here at all beyond the variable.
+#
+# So: this stops a job that calls agent-run BY ACCIDENT — a helper script, a copied snippet, a
+# retry loop — from dissolving the per-job tool ceiling for everything in the container. It
+# does not stop a shell that means to. Against a `bash` job the honest statement is the one in
+# jobs/README.md: a shell ends the idea of a per-job surface, and declaring one is the review.
+#
+# The escape hatch is deliberate and deliberately findable. One nobody can find is only worked
+# around in a way nobody can see, and blessing one with a flag would turn the decision into a
+# checkbox ticked in the same commit as the risky line.
 if [ -n "${AGENT_RUN_ID:-}" ]; then
   echo "agent-run: refusing to start '$JOB' from inside run ${AGENT_RUN_ID} of '${AGENT_JOB:-?}'." >&2
   echo "  A run cannot start another run: the tool ceiling is declared per job, and nesting" >&2
@@ -402,10 +410,17 @@ START=$(date -u +%s)
 printf '%s' "$PROMPT" > "$RUN_DIR/prompt.txt"
 cd "$DATA" || die "cannot enter $DATA"
 
-# The credential reaches pi through the environment of this one child process, and nowhere
-# else. Not `--api-key`, which would put the secret in `ps` and in /proc/<pid>/cmdline for
-# every process on the host to read. Not `set -a; . .env`, which would export every value to
-# every descendant including whatever an MCP server spawns.
+# The credential reaches pi through the environment of this one child process. What that buys
+# is WHICH values travel, not how far: only this provider's own set is passed, instead of every
+# value in the secrets file. Not `--api-key`, which would put the secret in `ps` and in
+# /proc/<pid>/cmdline for every process on the host to read. Not `set -a; . .env`, which would
+# export everything, including the credentials of providers this run is not using.
+#
+# It does NOT confine the credential to pi. A child inherits its parent's environment, so
+# anything pi spawns — an MCP server, and the model's own `bash` tool where a job declares one
+# — can read this variable. A job with a shell can print the provider key, and no arrangement
+# of this line prevents that. That is a property of giving a model a shell, not a defect to be
+# fixed here, and it is why declaring `bash` is the review.
 # A PROVIDER IS MORE THAN A KEY. One variable was enough only while the answer was always
 # "the vendor's public API". A deployment that may not send client data to a third party —
 # administration, healthcare, defence — reaches its model somewhere it can name: Azure OpenAI
