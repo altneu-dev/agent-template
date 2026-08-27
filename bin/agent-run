@@ -41,6 +41,7 @@ set -uo pipefail
 APP="${AGENT_APP:-/app}"
 DATA="${AGENT_DATA:-/data}"
 JOBS="$DATA/jobs"
+CUSTOM_JOBS="$DATA/custom-jobs"
 RUNS="$DATA/logs/runs"
 
 die() { echo "agent-run: $*" >&2; exit 40; }
@@ -55,13 +56,20 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --probe-tools) PROBE=1; shift ;;
     --list)
-      [ -d "$JOBS" ] || { echo "no jobs directory at $JOBS"; exit 0; }
       found=0
-      for f in "$JOBS"/*.md; do
-        [ -e "$f" ] || continue
-        b=$(basename "$f" .md); [ "$b" = "README" ] && continue
-        d=$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -1)
-        printf '  %-24s %s\n' "$b" "$d"; found=1
+      seen=" "
+      for dir in "$CUSTOM_JOBS" "$JOBS"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*.md; do
+          [ -e "$f" ] || continue
+          b=$(basename "$f" .md); [ "$b" = "README" ] && continue
+          case "$seen" in *" $b "*) continue ;; esac
+          seen="$seen$b "
+          d=$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -1)
+          src=""
+          [ "$dir" = "$CUSTOM_JOBS" ] && src=" (custom)"
+          printf '  %-24s %s%s\n' "$b" "$d" "$src"; found=1
+        done
       done
       [ "$found" = 0 ] && echo "no jobs defined — add one to agent/jobs/ (see its README)"
       exit 0 ;;
@@ -73,10 +81,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$JOB" ] || { echo "usage: agent-run <job> [--dry-run]   ('agent-run --list' shows them)" >&2; exit 40; }
 
-JOB_FILE="$JOBS/$JOB.md"
+JOB_FILE="$CUSTOM_JOBS/$JOB.md"
+[ -f "$JOB_FILE" ] || JOB_FILE="$JOBS/$JOB.md"
 [ -f "$JOB_FILE" ] || {
   echo "agent-run: no such job: $JOB" >&2
-  echo "  jobs live in agent/jobs/ and arrive with the deployment; 'agent-run --list' shows them." >&2
+  echo "  jobs live in agent/jobs/ and optional custom jobs live in /data/custom-jobs; 'agent-run --list' shows them." >&2
   exit 10
 }
 
