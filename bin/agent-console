@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# agent-console — terminal helper for observing and steering an agent from inside the container.
+set -euo pipefail
+
+DATA=${AGENT_DATA:-/data}
+CUSTOM_JOBS=${AGENT_CUSTOM_JOBS:-$DATA/custom-jobs}
+REPORTS=${AGENT_REPORTS:-$DATA/work/reports}
+
+usage() {
+  cat <<'EOF'
+usage: agent-console <command> [args]
+
+Observe:
+  status                 Show recent runs and readiness/memory summary
+  list                   List built-in and custom jobs
+  runs [job]             Show latest run metadata files
+  report <job>           Print the likely report for a job
+
+Operate:
+  dry-run <job>          Show the exact pi command without running it
+  run <job>              Run a job now in this terminal
+
+Create jobs:
+  new <job>              Create a guarded custom job template and open $EDITOR
+  edit <job>             Edit a custom job
+  path <job>             Print the custom job path
+
+Host-side systemd deployments can wrap this with service start/watch commands.
+EOF
+}
+
+need_job() { [ $# -gt 0 ] && [ -n "$1" ] || { echo "job name required" >&2; exit 40; }; }
+report_path() {
+  case "$1" in
+    recon) echo "$REPORTS/ratslotse-recon.md" ;;
+    validate) echo "$REPORTS/ratslotse-validation.md" ;;
+    test-pr) echo "$REPORTS/ratslotse-test-pr.md" ;;
+    *) echo "$REPORTS/$1.md" ;;
+  esac
+}
+
+cmd=${1:-help}; [ $# -gt 0 ] && shift || true
+case "$cmd" in
+  status)
+    agent-status || true
+    echo
+    agent-status --memory || true
+    ;;
+  list)
+    agent-run --list
+    ;;
+  runs)
+    if [ $# -gt 0 ]; then
+      find "$DATA/logs/runs/$1" -maxdepth 2 -type f -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort || true
+    else
+      find "$DATA/logs/runs" -maxdepth 3 -type f -name last.json -printf '%TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null | sort || true
+    fi
+    ;;
+  report)
+    need_job "$@"; p=$(report_path "$1")
+    [ -f "$p" ] || { echo "no report found at $p" >&2; exit 1; }
+    ${PAGER:-less -R} "$p" 2>/dev/null || cat "$p"
+    ;;
+  dry-run)
+    need_job "$@"; agent-run "$1" --dry-run
+    ;;
+  run)
+    need_job "$@"; agent-run "$1"
+    ;;
+  path)
+    need_job "$@"; echo "$CUSTOM_JOBS/$1.md"
+    ;;
+  new)
+    need_job "$@"; job="$1"; f="$CUSTOM_JOBS/$job.md"
+    mkdir -p "$CUSTOM_JOBS"
+    [ ! -e "$f" ] || { echo "$f already exists" >&2; exit 1; }
+    cat > "$f" <<EOF
+---
+description: Describe what this job should do.
+tools: read, grep, find, ls, bash, write
+produces: work/reports/$job.md
+timeout_s: 1200
+---
+Write the task instructions here.
+
+Guardrails:
+- Follow this repository's code of conduct and contribution guide.
+- Prefer read-only investigation first; ask before risky changes.
+- For code changes, use a short-lived branch and never modify long-lived branches directly.
+- Do not print secrets.
+- Write the report to work/reports/$job.md.
+EOF
+    ${EDITOR:-nano} "$f"
+    ;;
+  edit)
+    need_job "$@"; f="$CUSTOM_JOBS/$1.md"
+    [ -f "$f" ] || { echo "no such custom job: $f" >&2; exit 1; }
+    ${EDITOR:-nano} "$f"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *) usage >&2; exit 40 ;;
+esac

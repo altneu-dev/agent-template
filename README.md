@@ -22,6 +22,7 @@ docker compose exec agent agent-secret check     # is it configured?
 docker compose exec agent agent-run --list       # what can it do?
 docker compose exec agent agent-run <job>        # do it
 docker compose exec agent agent-status           # what has it been doing?
+docker compose exec agent agent-console list     # easier terminal control surface
 ```
 
 `git push` redeploys. Nothing a push does can lose the agent's memory — and the deployment
@@ -123,6 +124,25 @@ deliberately not the request itself, which quotes the client's own systems. `age
 or still points at the reserved placeholder every fork starts with, and a failed send is
 reported rather than swallowed. An escalation nobody hears is the same
 outcome as no escalation at all, which is why this is checked rather than documented.
+
+## Terminal interface
+
+For day-to-day use, `agent-console` is the easy interface inside the container:
+
+```bash
+docker compose exec agent agent-console status
+docker compose exec agent agent-console list
+docker compose exec agent agent-console dry-run <job>
+docker compose exec agent agent-console run <job>
+docker compose exec agent agent-console runs [job]
+docker compose exec agent agent-console report <job>
+docker compose exec agent agent-console new <job>
+docker compose exec agent agent-console edit <job>
+```
+
+`agent-console new <job>` creates a guarded Markdown job template in `/data/custom-jobs`.
+Those custom jobs survive redeploys and override same-named image jobs. They are for quick
+operator-created tasks; committed repeatable automation still belongs in `agent/jobs/`.
 
 ## Observability
 
